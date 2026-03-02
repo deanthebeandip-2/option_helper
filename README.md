@@ -20,19 +20,25 @@ It randomly samples from those real historical distributions 10 million times, c
 Step 3 — Conditional sampling
 Weeks are bucketed by how Monday behaved (bear / flat / bull). Each regime gets its own separate simulation, capturing momentum and mean-reversion effects.
 
-Example output
-  Options insights for Friday expiry [Unconditional]  (Mon open $17.15):
-
-    Strike      Move     Prob
-  $    19.23   +12%    5.2%  ██  <- covered call
-  $    19.05   +11%    6.8%  ███  <- covered call
-  $    18.87   +10%    8.7%  ████  <- covered call
-       ...
-  $    17.32    +1%   48.3%  ████████████████████████  <- covered call
-
-  $    16.98    -1%   43.1%  █████████████████████  <- secured put
-       ...
-  $    15.09   -12%    4.1%  ██  <- secured put
+ Options insights for Friday expiry  [Unconditional]  (Mon open $174.80):
+      Strike    Move     Prob  Direction
+  ------------------------------------------
+  $   195.78    +12%     5.7%  ██  <- covered call 
+  
+  $   194.03    +11%     7.1%  ███  <- covered call 
+  
+  $   192.28    +10%     8.9%  ████  <- covered call 
+  
+  $   190.53     +9%    11.2%  █████  <- covered call 
+  
+  $   162.56     -7%     7.2%  ███  <- secured put 
+  
+  $   160.82     -8%     5.1%  ██  <- secured put 
+  
+  $   159.07     -9%     3.5%  █  <- secured put 
+  
+  $   157.32    -10%     2.4%  █  <- secured put  
+  
 
   Simulated 90% confidence range: $14.82 - $19.91
 
