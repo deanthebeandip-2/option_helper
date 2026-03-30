@@ -1,0 +1,16 @@
+
+
+3/30/2026 Thoughts:
+Been using this option helper for around a month now, it's been working pretty well. Helps me pick fringe prices (10-15% or lower probability prices)
+
+Next Features:
+1) Have a show option before each module. For example at the start of the script there will be 
+weekly_updown = 1
+strike_move_unconditional = 0
+etc.
+Then this will determine whether I print that module in the report or not, just so the user will have more control on how short/long/clean/elaborate the report will be.
+
+2) Need to have a Friday -> Monday jump as well. This will help uncover the "After hours" on the weekends. I notice this changes a lot and a lot of weird shady shit happens during the weekend. 
+
+3) Already did this with conditional sampling: Bear/Flat/Bull monday, but could create more buckets. Right now the deltas are set in stone -1, -1~+1, +1, the next step is to let them be dynamic, and back test to see what ranges are most "accurate" given the history. For example is it better to have -3.5% as the cutoff? or -4.5%? etc. This will help determine which tailored thresholds to use for each stock. Also thinking each "wing +/-" could have multiple nodes instead of 1. Just another concept
+
