@@ -32,11 +32,33 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-TICKERS        = ["NVDA", "WULF", "SOFI"]
+TICKERS        = ["SOFI"]
+#TICKERS        = ["NVDA", "WULF", "SOFI"]
 LOOKBACK_YEARS = 3
-N_SIMULATIONS  = 10_000_000
+N_SIMULATIONS  = 1_000_000
 #N_SIMULATIONS  = 10_000
 CONFIDENCE     = [0.05, 0.25, 0.50, 0.75, 0.95]
+
+
+# ─────────────────────────────────────────────
+# REPORT CONFIGURATION
+# ─────────────────────────────────────────────
+
+REPORT = {
+    # Console reports
+    "spread_table": 0, #don't need
+    "weekly_summary": 1, #useful
+    "simulation_summary": True, # option grid nested inside
+    "options_grid": True,
+    "conditional_sampling": False,
+
+    # Graphics
+    "charts": False,
+
+    # Future modules
+    "backtesting": False,
+    "live_analysis": False,
+}
 
 DAY_PAIRS = [
     ("Monday",    "Tuesday"),
@@ -517,7 +539,8 @@ def print_simulation_summary(ticker: str, start_price: float,
               f"  ${row['mean']:>9.2f}")
 
     fri = paths[:, 4]
-    print_options_grid(ticker, start_price, fri, label="Unconditional")
+    if REPORT["options_grid"]: 
+        print_options_grid(ticker,start_price,fri,label="Unconditional")
 
 
 def print_conditional_summary(
@@ -563,12 +586,14 @@ def print_conditional_summary(
                   f"{s['p5']:>7.2f} {s['p25']:>7.2f} {s['p75']:>7.2f} {s['p95']:>7.2f}")
 
         # Run a mini Monte Carlo for this regime and print the options grid
-        cond_paths = run_monte_carlo_conditional(
-            start_price, conditional_spreads, regime, n_sims=N_SIMULATIONS
-        )
-        cond_fri = cond_paths[:, 4]
-        print_options_grid(ticker, start_price, cond_fri, label=f"{label_map[regime]}")
+        if REPORT["options_grid"]: 
+            cond_paths = run_monte_carlo_conditional(
+                start_price, conditional_spreads, regime, n_sims=N_SIMULATIONS
+            )
+            cond_fri = cond_paths[:, 4]
+            print_options_grid(ticker,start_price,cond_fri,label="Unconditional")
 
+        
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -599,22 +624,33 @@ def main():
         print(f"  Using Mon open    : ${start_price:.2f}")
         print(f"  Data range        : {df.index[0].date()} -> {df.index[-1].date()}  ({len(df)} trading days)")
 
+
+
+
         # ── Unconditional analysis ───────────────────────────────────────
         spreads = compute_dow_spreads(df)
-        print_spread_table(ticker, spreads)
+        if REPORT["spread_table"]:
+            print_spread_table(ticker, spreads)
 
         weekly_spread = compute_weekly_spread(df)
-        print_weekly_spread_table(ticker, weekly_spread)
+        if REPORT["weekly_summary"]:
+            print_weekly_spread_table(ticker, weekly_spread)
 
         paths       = run_monte_carlo(start_price, spreads)
         sim_summary = summarize_simulations(paths)
-        print_simulation_summary(ticker, start_price, sim_summary, paths)
 
-        plot_ticker(ticker, start_price, df, spreads, paths, sim_summary, weekly_spread)
+        if REPORT["simulation_summary"]:
+            print_simulation_summary(ticker, start_price, sim_summary, paths)
+        if REPORT["charts"]:
+            plot_ticker(ticker, start_price, df, spreads, paths, sim_summary, weekly_spread)
+
+
 
         # ── Conditional sampling analysis ────────────────────────────────
-        conditional_spreads, week_regime = compute_conditional_spreads(df)
-        print_conditional_summary(ticker, start_price, conditional_spreads, week_regime)
+        if REPORT["conditional_sampling"]:
+            conditional_spreads, week_regime = compute_conditional_spreads(df)
+            print_conditional_summary(ticker, start_price, conditional_spreads, week_regime)
+            print(f"\n\n\n\n{'#'*66}")
 
     print(f"\nDone! Charts saved as PNG files in the current directory.\n")
 
