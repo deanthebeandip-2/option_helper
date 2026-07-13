@@ -11,17 +11,74 @@ strike_move_unconditional = 0
 etc.
 Then this will determine whether I print that module in the report or not, just so the user will have more control on how short/long/clean/elaborate the report will be.
 
-
+[COMPLETED]
 2) Need to have a Friday -> Monday jump as well. This will help uncover the "After hours" on the weekends. I notice this changes a lot and a lot of weird shady shit happens during the weekend. 
 
 
 
-3) Already did this with conditional sampling: Bear/Flat/Bull monday, but could create more buckets. Right now the deltas are set in stone -1, -1~+1, +1, the next step is to let them be dynamic, and back test to see what ranges are most "accurate" given the history. For example is it better to have -3.5% as the cutoff? or -4.5%? etc. This will help determine which tailored thresholds to use for each stock. Also thinking each "wing +/-" could have multiple nodes instead of 1. Just another concept
+[COMPLETED]
+Feature 3 — Dynamic Conditional Sampling Optimization
+Objective
+The current conditional sampling model classifies Monday's Open → Close move into three fixed regimes:
+Bear: < -1%
+Flat: -1% to +1%
+Bull: > +1%
+These thresholds are currently hardcoded and may not be optimal for every stock.
+The goal is to automatically determine the regime boundaries that produce the most accurate historical predictions.
+1. Dynamic Threshold Search
+Instead of using fixed values, search over multiple possible threshold combinations.
+Example search space:
+Bear Threshold:
+-0.5%
+-1.0%
+-1.5%
+...
+-5.0%
+Bull Threshold:
++0.5%
++1.0%
++1.5%
+...
++5.0%
+Each pair of thresholds defines a unique regime classification.
+
+Example:
+Bear : < -2.5%
+Flat : -2.5% to +3.0%
+Bull : > +3.0%
+
+So each stock would have a dynamic range of what's considered a Bear/Flat/Bull market.
 
 
 
-4) Really important: Need to have a "live" analysis. Not just "What did the price say Monday market open". I need this option helper to work no matter what time of the week. Sunday afternoon, Monday before market, Monday after 9:30am, Monday after 4, Tuesday Morning, etc. This helper should be able to work at any time, and the end goal is to simulate the closing on Friday. So this option helper needs to use the current date (e.g. Wednesday) and create a Friday spread based off the current day + current week's prices.
+
+
+4) Really important: Need to have a "live" analysis. Not just "What did the price say Monday market open". I need this option helper to work no matter what time of the week. Sunday afternoon, Monday before market, Monday after 9:30am, Monday after 4, Tuesday Morning, etc. This helper should be able to work at any time, and the end goal is to simulate the closing on the upcoming Friday. So this option helper needs to use the current date (e.g. Wednesday) and create an upcoming Friday spread based off the current day + current week's prices.
 
 5) Best feature first to work on? Give a day by day forecast. For example if today is 4/1/2026, then give a +1, +2 all the way to 10 day monte carlo forecast. Then each "jump" would depend on the historic M-T, T-W etc jumps. So if 4/1/2026 is a Wednesday, then 4/2/2026 forecast would need a Wed -> Thurs jump.
 
 6) Saw an interesting point from hedge funds, use Markov chain (only care about what your current state is, to determine the possible next states) to better determine the next state (monto carelo simulation). This would remove noise and make it so that it's smart enough to know what happened in the last situation, current situation, and what will most likely happen in the next week based off that.
+
+7) GPT's idea: For every historical Monday, 
+For every historical Monday:
+Pretend you're standing on that Monday.
+Run the Monte Carlo using only data available up to that point.
+Predict the Friday probabilities.
+Compare against what actually happened.
+
+Example analysis based on historical data:
+90% interval actually contained price:
+91%
+Expected assignment probability:
+28%
+Actual:
+30%
+
+If your model is well calibrated, you'll know it's trustworthy. If not, you'll know where it needs improvement. 
+
+My recommended development order
+✅ Dynamic Bear/Flat/Bull thresholds
+✅ Historical calibration/backtesting (new suggestion)
+✅ 10-day forecast
+✅ Live analysis
+✅ Markov chain engine
