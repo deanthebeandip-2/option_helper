@@ -49,36 +49,212 @@ Bull : > +3.0%
 
 So each stock would have a dynamic range of what's considered a Bear/Flat/Bull market.
 
-
-
-
-
+[COMPLETED]
+Working on this concurrently with 3, since having day to day dynamic thresholds would also solve this problem. No longer am I confined to just Friday's close as the target forecast, but a dynamic (+1, +3, +5, etc rolling prediction using Markov + montecarlo)
 4) Really important: Need to have a "live" analysis. Not just "What did the price say Monday market open". I need this option helper to work no matter what time of the week. Sunday afternoon, Monday before market, Monday after 9:30am, Monday after 4, Tuesday Morning, etc. This helper should be able to work at any time, and the end goal is to simulate the closing on the upcoming Friday. So this option helper needs to use the current date (e.g. Wednesday) and create an upcoming Friday spread based off the current day + current week's prices.
 
+[COMPLETED]
+Working on this concurrently with 3, since having day to day dynamic thresholds would also solve this problem
 5) Best feature first to work on? Give a day by day forecast. For example if today is 4/1/2026, then give a +1, +2 all the way to 10 day monte carlo forecast. Then each "jump" would depend on the historic M-T, T-W etc jumps. So if 4/1/2026 is a Wednesday, then 4/2/2026 forecast would need a Wed -> Thurs jump.
 
+
+[COMPLETED]
+Working on this concurrently with 3, since having day to day dynamic thresholds would utilize Markov chain (using past 2 states to determine current state)
 6) Saw an interesting point from hedge funds, use Markov chain (only care about what your current state is, to determine the possible next states) to better determine the next state (monto carelo simulation). This would remove noise and make it so that it's smart enough to know what happened in the last situation, current situation, and what will most likely happen in the next week based off that.
 
-7) GPT's idea: For every historical Monday, 
-For every historical Monday:
-Pretend you're standing on that Monday.
-Run the Monte Carlo using only data available up to that point.
-Predict the Friday probabilities.
-Compare against what actually happened.
 
-Example analysis based on historical data:
-90% interval actually contained price:
-91%
-Expected assignment probability:
-28%
-Actual:
-30%
+7) GPT's idea: 
 
-If your model is well calibrated, you'll know it's trustworthy. If not, you'll know where it needs improvement. 
+==========================================
+MODEL SCORECARD
+==========================================
 
-My recommended development order
-✅ Dynamic Bear/Flat/Bull thresholds
-✅ Historical calibration/backtesting (new suggestion)
-✅ 10-day forecast
-✅ Live analysis
-✅ Markov chain engine
+1-Day Forecast
+MAE
+0.92%
+
+RMSE
+1.18%
+
+Calibration
+50%
+49.8%
+
+75%
+74.9%
+
+90%
+90.7%
+
+95%
+95.1%
+
+==========================================
+
+5-Day Forecast
+MAE
+2.44%
+
+RMSE
+3.12%
+
+Calibration
+50%
+50.5%
+
+75%
+74.2%
+
+90%
+89.6%
+
+95%
+94.8%
+
+==========================================
+Covered Calls
+Assignment Probability Error
+Average
+
+1.6%
+
+Maximum
+
+4.3%
+
+==========================================
+
+Overall Model Score
+
+★★★★☆
+
+9.2 / 10
+
+
+
+
+
+
+
+Next steps:
+[COMPLETED]
+Phase 1: Second-order state model (9 states based on the previous two transitions). This replaces the Monday-centric logic and becomes the new foundation.
+
+QOL:
+1) Add 1, 2, 3, 4, 5 instead of up to 10. days, because the further down you go the more noise, better to just keep the analysis max of 5 days.
+2) Instead of +1 days, +2 days, show the date. For example if today is 7/14/2026. I want to see +1 as 7/15/2026, etc. Just to make it easier to read.
+
+Build a model evaluator
+
+Phase 2: Enrich the state with additional observable features such as volatility, SPY trend, or volume, if backtesting shows they improve predictions.
+Phase 3: Experiment with Hidden Markov Models or regime-switching models, but only if they demonstrably outperform the simpler approach. HMMs can capture latent market regimes, but they add considerable complexity and require careful validation to avoid overfitting.
+
+
+
+
+8) 
+Hidden Markov Models (Future Enhancement)
+
+The current implementation assumes the market state is directly observable from recent price transitions.
+
+A future enhancement is to replace the explicit state definition with a Hidden Markov Model (HMM).
+
+In this approach:
+
+the true market regime is hidden
+observable market variables (returns, volatility, volume, etc.) are emitted from that hidden state
+the HMM estimates the probability of the current hidden regime
+Monte Carlo simulations sample conditioned on the inferred hidden regime
+
+This allows the model to recognize latent market environments that are not obvious from price action alone.
+
+
+
+9)
+Regime-Switching Models (Future Enhancement)
+
+Another future enhancement is to allow transition probabilities to vary based on broader market conditions.
+
+Instead of using a single transition matrix:
+
+Bull → Bull = 55%
+
+the transition matrix may depend on macroeconomic variables such as:
+
+VIX regime
+Federal Reserve policy
+SPY trend
+Market volatility
+Earnings season
+
+This creates a regime-switching model in which market behavior changes depending on the overall environment rather than assuming a stationary process.
+
+
+
+
+
+
+
+
+
+Order Road map:
+My reordered roadmap
+PHASE 1
+--------------------------
+✓ Second-order state model
+PHASE 2 ⭐
+--------------------------
+Model Evaluator
+
++1 day accuracy
+
++2 day accuracy
+
++3 day accuracy
+
++4 day accuracy
+
++5 day accuracy
+
+Calibration
+
+Covered-call accuracy
+
+Overall score
+PHASE 3
+--------------------------
+QOL
+
+Real dates
+
+Only 5-day forecast
+
+Cleaner report
+PHASE 4
+--------------------------
+Research
+
+SPY
+
+ATR
+
+Volume
+
+VIX
+
+RSI
+
+Gap size
+
+IV Rank
+
+Feature importance
+PHASE 5
+--------------------------
+Advanced Models
+
+Regime Switching
+
+Hidden Markov Models
+
+Neural Networks (if ever)

@@ -1,21 +1,23 @@
 """
-Stock Monte Carlo Simulator — Day-of-Week Spread Analysis
-=========================================================
-Uses historical closing prices to model day-to-day % moves.
-  - Fri->Mon  : Friday CLOSE (prior week) -> Monday OPEN   [weekend gap]
-  - Mon->Tue  : Monday OPEN  -> Tuesday CLOSE
-  - Tue->Wed  : Tuesday CLOSE -> Wednesday CLOSE
-  - Wed->Thu  : Wednesday CLOSE -> Thursday CLOSE
-  - Thu->Fri  : Thursday CLOSE -> Friday CLOSE
-  - Weekly    : Monday OPEN  -> Friday CLOSE
+Stock Monte Carlo Simulator — State-Conditional Forecasting Engine
+====================================================================
+Replaces the old "Monday regime" model with a general state-based
+conditional Monte Carlo engine that works on any trading day.
 
-Conditional Sampling: sub-buckets the post-Monday distributions based on
-how strong/weak Monday's open->close move was (the "regime"), capturing
-momentum and mean-reversion effects. Regime boundaries are NOT hardcoded —
-they're chosen automatically per-ticker by backtesting a grid of candidate
-thresholds against actual historical weeks (leave-one-week-out validation)
-and picking whichever split minimizes prediction error. Results are cached
-in regime_thresholds.json so you don't have to re-optimize every run.
+Core idea:
+  - The trading week is a repeating 5-transition cycle:
+        Fri->Mon (weekend gap), Mon->Tue, Tue->Wed, Wed->Thu, Thu->Fri
+  - Each transition is classified Bear/Flat/Bull using thresholds that
+    are optimized INDEPENDENTLY per transition type (Fri->Mon behaves
+    differently than Tue->Wed, etc.)
+  - The "market state" = (regime of the 2nd-most-recent transition,
+    regime of the most recent transition) -> 9 possible states.
+  - Monte Carlo paths are simulated as a genuine Markov chain: each
+    simulated day, every path samples its next move from historical
+    observations that occurred in ITS current state, then the path's
+    state updates based on what was sampled. Paths diverge over time.
+  - Supports arbitrary rolling forecast horizons (+1, +3, +5, +10... days)
+    from whatever the most recent close is, on any day of the week.
 
 Install deps:
     pip install yfinance pandas numpy matplotlib scipy
@@ -31,6 +33,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.ticker import FuncFormatter
 from datetime import datetime, timedelta
+from collections import defaultdict
 import json
 import os
 import warnings
@@ -39,12 +42,13 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-TICKERS        = ["NVDA"]
-#TICKERS        = ["NVDA", "WULF", "SOFI"]
-LOOKBACK_YEARS = 6
+#TICKERS        = ["SOFI"]
+TICKERS        = ["SOFI", "CRWV", "NVDA", "WULF", "HOOD"]
+LOOKBACK_YEARS = 10
 N_SIMULATIONS  = 1_000_000
 #N_SIMULATIONS  = 10_000
 CONFIDENCE     = [0.05, 0.25, 0.50, 0.75, 0.95]
+FORECAST_HORIZONS = [1, 3, 5, 10]     # rolling forecast horizons, in trading days
 
 
 # ─────────────────────────────────────────────
@@ -53,21 +57,23 @@ CONFIDENCE     = [0.05, 0.25, 0.50, 0.75, 0.95]
 
 REPORT = {
     # Console reports
-    "spread_table": 0, #don't need
-    "weekly_summary": 1, #useful
-    "simulation_summary": True, # option grid nested inside
-    "options_grid": True,
-    "conditional_sampling": 1, #now with dynamic conditional
+    "spread_table": 0,          # don't need
+    "weekly_summary": 1,        # useful, still Mon open -> Fri close (unconditional)
+    "simulation_summary": True, # unconditional weekly Monte Carlo
+    "options_grid": True,       # used by both weekly and state-forecast sections
+    "state_forecast": True,     # NEW: state-conditional rolling forecast engine
+    "state_diagnostics": True,  # NEW: print the 9-state occurrence table
 
     # Graphics
-    "charts": 1,
+    "charts": False,            # unconditional weekly chart only
 
     # Future modules
     "backtesting": False,
     "live_analysis": False,
 }
 
-# Order matters: Fri->Mon (weekend gap) now leads the weekday chain.
+# The 5-transition weekly cycle. Order matters — it defines both the
+# unconditional weekly chain AND the state-machine cycle.
 DAY_PAIRS = [
     ("Friday",    "Monday"),    # weekend gap (crosses weeks)
     ("Monday",    "Tuesday"),
@@ -75,45 +81,26 @@ DAY_PAIRS = [
     ("Wednesday", "Thursday"),
     ("Thursday",  "Friday"),
 ]
-# 6 labels for 6 path columns: start (prior Fri close) + 5 transitions
-DAY_NAMES = ["Fri*", "Mon", "Tue", "Wed", "Thu", "Fri"]
+DAY_NAMES = ["Fri*", "Mon", "Tue", "Wed", "Thu", "Fri"]   # for the weekly chain (6 points)
 
-# ── Dynamic Conditional Sampling ─────────────────────────────────────────
-N_REGIMES              = 7      # 3, 5, or 7 buckets
-                                 #   3 -> bear / flat / bull
-                                 #   5 -> bear / slight_bear / flat / slight_bull / bull
-                                 #   7 -> strong_bear ... strong_bull  (BigDown..BigUp)
-OPTIMIZE_THRESHOLDS     = True  # search for best regime boundaries per ticker each run
+TRANSITION_TYPE_LABELS = [f"{f[:3]}->{t[:3]}" for f, t in DAY_PAIRS]   # Fri->Mon, Mon->Tue, ...
+TRANSITION_TYPE_INDEX  = {pair: i for i, pair in enumerate(DAY_PAIRS)}
+N_TYPES = len(DAY_PAIRS)
+
+# ── State-Conditional Engine settings ────────────────────────────────────
+REGIME_LABELS       = ["bear", "flat", "bull"]
+DEFAULT_BOUNDARIES  = [-1.0, 1.0]      # fallback if a type can't be optimized
+
+OPTIMIZE_THRESHOLDS      = True
 SAVE_OPTIMIZED_THRESHOLDS = True
-THRESHOLDS_FILE        = "regime_thresholds.json"
-MIN_BUCKET_SIZE         = 8     # min weeks per regime bucket to be considered valid
-MIN_BACKTEST_WEEKS      = 10    # min usable backtested weeks to trust a scheme
+THRESHOLDS_FILE          = "state_regime_thresholds.json"
 
-# Search grids
-BEAR_GRID  = np.arange(-5.0, -0.4, 0.5)   # used when N_REGIMES == 3: -5.0 ... -0.5
-BULL_GRID  = np.arange(0.5, 5.1, 0.5)     # used when N_REGIMES == 3: +0.5 ... +5.0
-SCALE_GRID = np.arange(0.3, 2.05, 0.1)    # used when N_REGIMES in (5, 7)
+MIN_BUCKET_SIZE   = 15   # min occurrences per bear/flat/bull bucket for a threshold candidate to be valid
+MIN_STATE_SAMPLES = 20   # min (state, next_type) pool size before falling back to the type's unconditional pool
 
-# Relative boundary shapes (in %), scaled by SCALE_GRID for 5/7-bucket search
-REGIME_TEMPLATES = {
-    3: [-1.0, 1.0],
-    5: [-2.0, -1.0, 1.0, 2.0],
-    7: [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0],
-}
-REGIME_LABELS = {
-    3: ["bear", "flat", "bull"],
-    5: ["bear", "slight_bear", "flat", "slight_bull", "bull"],
-    7: ["strong_bear", "bear", "slight_bear", "flat", "slight_bull", "bull", "strong_bull"],
-}
-REGIME_DISPLAY = {
-    "strong_bear": "STRONG BEAR (BigDown)", "bear": "BEAR",
-    "slight_bear": "SLIGHT BEAR",           "flat": "FLAT",
-    "slight_bull": "SLIGHT BULL",           "bull": "BULL",
-    "strong_bull": "STRONG BULL (BigUp)",
-}
-
-# Legacy fallback if optimization is off and no saved thresholds exist yet
-MON_REGIME_THRESHOLDS_DEFAULT = REGIME_TEMPLATES[3]  # (-1.0, +1.0)
+# Threshold search grid (per transition type, searched independently)
+BEAR_GRID = np.arange(-5.0, -0.24, 0.25)   # -5.00 ... -0.25
+BULL_GRID = np.arange(0.25, 5.01, 0.25)    # +0.25 ... +5.00
 
 # Palette
 C_BEAR   = "#d73027"
@@ -139,34 +126,26 @@ def fetch_data(ticker: str, years: int = LOOKBACK_YEARS) -> pd.DataFrame:
     df["Close"] = df["Close"].squeeze()
     df.index    = pd.to_datetime(df.index)
     df["DayName"] = df.index.day_name()
-    return df.dropna()
+    return df.dropna().sort_index()
 
 
 # ─────────────────────────────────────────────
 # WEEKEND GAP SPREAD  (Fri Close -> Mon Open, crosses weeks)
+# — used only by the unconditional weekly chain below
 # ─────────────────────────────────────────────
 def compute_weekend_spread(df: pd.DataFrame) -> np.ndarray:
-    """
-    Pairs each Monday's Open with the CLOSE of the immediately preceding
-    trading day, keeping only cases where that prior trading day was
-    actually a Friday (skips holiday-shortened weeks where Monday follows
-    a Tuesday-Thursday close instead).
-    """
-    df_sorted = df.sort_index()
+    df_sorted  = df.sort_index()
     prev_close = df_sorted["Close"].shift(1)
     prev_day   = df_sorted["DayName"].shift(1)
-
     mask = (df_sorted["DayName"] == "Monday") & (prev_day == "Friday")
-
     mon_open  = df_sorted.loc[mask, "Open"]
     fri_close = prev_close[mask]
-
     pct_chg = ((mon_open - fri_close) / fri_close) * 100
     return np.array(pct_chg).flatten()
 
 
 # ─────────────────────────────────────────────
-# DAY-TO-DAY SPREAD DISTRIBUTIONS
+# DAY-TO-DAY SPREAD DISTRIBUTIONS (unconditional, week-keyed)
 # ─────────────────────────────────────────────
 def compute_dow_spreads(df: pd.DataFrame) -> dict:
     df = df.copy()
@@ -179,17 +158,14 @@ def compute_dow_spreads(df: pd.DataFrame) -> dict:
         if from_day == "Friday" and to_day == "Monday":
             spreads[(from_day, to_day)] = compute_weekend_spread(df)
             continue
-
         if from_day == "Monday":
             from_rows = (df[df["DayName"] == from_day][["Open", "WeekKey"]]
                          .rename(columns={"Open": "From"}))
         else:
             from_rows = (df[df["DayName"] == from_day][["Close", "WeekKey"]]
                          .rename(columns={"Close": "From"}))
-
         to_rows = (df[df["DayName"] == to_day][["Close", "WeekKey"]]
                    .rename(columns={"Close": "To"}))
-
         merged  = pd.merge(from_rows, to_rows, on="WeekKey")
         pct_chg = ((merged["To"] - merged["From"]) / merged["From"]) * 100
         spreads[(from_day, to_day)] = np.array(pct_chg).flatten()
@@ -197,301 +173,302 @@ def compute_dow_spreads(df: pd.DataFrame) -> dict:
 
 
 # ─────────────────────────────────────────────
-# REGIME CLASSIFICATION (generic N-bucket)
+# TRANSITION SEQUENCE  (continuous, chronological, holiday-safe)
+# — this is the backbone of the state-conditional engine
 # ─────────────────────────────────────────────
-def classify_regime(pct: float, boundaries: list, labels: list) -> str:
+def build_transition_sequence(df: pd.DataFrame) -> list:
     """
-    boundaries has len(labels)-1 entries, sorted ascending.
-    e.g. boundaries=[-1,1], labels=["bear","flat","bull"]
-         pct < -1        -> "bear"
-         -1 <= pct <= 1  -> "flat"
-         pct > 1         -> "bull"
+    Walks the dataframe day by day and emits one entry per valid transition
+    (i.e. where consecutive trading days match one of the 5 canonical weekly
+    pairs). Holiday-shortened weeks that break a pair (e.g. Monday directly
+    followed by Wednesday because Tuesday was a holiday) are silently
+    skipped for that specific transition — the sequence just has a gap
+    there, which is fine since the state machine only looks at the most
+    recent two entries in the list, not the calendar.
     """
-    for edge, lbl in zip(boundaries, labels[:-1]):
-        if pct < edge:
-            return lbl
-    return labels[-1]
-
-
-def format_regime_range(boundaries: list, labels: list, idx: int) -> str:
-    if idx == 0:
-        return f"< {boundaries[0]:+.2f}%"
-    if idx == len(labels) - 1:
-        return f"> {boundaries[-1]:+.2f}%"
-    return f"{boundaries[idx-1]:+.2f}% to {boundaries[idx]:+.2f}%"
-
-
-# ─────────────────────────────────────────────
-# CONDITIONAL SAMPLING  (Mon regime -> rest-of-week dist)
-# ─────────────────────────────────────────────
-def compute_conditional_spreads(df: pd.DataFrame, boundaries: list, labels: list) -> tuple:
-    """
-    Splits the Mon->Tue, Tue->Wed, Wed->Thu, Thu->Fri distributions based on
-    how Monday's open->close move (the "regime") behaved, using the given
-    boundaries/labels (either the fixed default or optimizer output).
-
-    The Fri->Mon weekend leg happens BEFORE the regime is known, so it uses
-    the same unconditional weekend distribution for every regime bucket.
-
-    Returns (conditional_spreads dict, week_regime dataframe).
-    """
-    df = df.copy()
-    df["ISOWeek"] = df.index.isocalendar().week.values
-    df["ISOYear"] = df.index.isocalendar().year.values
-    df["WeekKey"] = df["ISOYear"].astype(str) + "-" + df["ISOWeek"].astype(str)
-
-    mon_days = df[df["DayName"] == "Monday"][["Open", "Close", "WeekKey"]].copy()
-    mon_days["MonRegimePct"] = ((mon_days["Close"] - mon_days["Open"]) / mon_days["Open"]) * 100
-    mon_days["Regime"] = mon_days["MonRegimePct"].apply(lambda p: classify_regime(p, boundaries, labels))
-    week_regime = mon_days[["WeekKey", "Regime", "MonRegimePct"]].copy()
-
-    conditional = {}
-
-    weekend_arr = compute_weekend_spread(df)
-    for regime in labels:
-        conditional[("Friday", "Monday", regime)] = weekend_arr
-
-    tue_days = df[df["DayName"] == "Tuesday"][["Close", "WeekKey"]].rename(columns={"Close": "TueClose"})
-    mon_open = mon_days[["Open", "WeekKey", "Regime", "MonRegimePct"]].rename(columns={"Open": "MonOpen"})
-    mon_tue  = pd.merge(mon_open, tue_days, on="WeekKey").dropna()
-    mon_tue["PctChg"] = ((mon_tue["TueClose"] - mon_tue["MonOpen"]) / mon_tue["MonOpen"]) * 100
-
-    for regime in labels:
-        subset = mon_tue[mon_tue["Regime"] == regime]["PctChg"].values
-        conditional[("Monday", "Tuesday", regime)] = np.array(subset).flatten()
-
-    for from_day, to_day in DAY_PAIRS[2:]:  # Tue->Wed, Wed->Thu, Thu->Fri
-        from_rows = (df[df["DayName"] == from_day][["Close", "WeekKey"]]
-                     .rename(columns={"Close": "From"}))
-        to_rows   = (df[df["DayName"] == to_day][["Close", "WeekKey"]]
-                     .rename(columns={"Close": "To"}))
-        merged    = pd.merge(from_rows, to_rows, on="WeekKey")
-        merged    = pd.merge(merged, week_regime, on="WeekKey")
-        merged["PctChg"] = ((merged["To"] - merged["From"]) / merged["From"]) * 100
-
-        for regime in labels:
-            subset = merged[merged["Regime"] == regime]["PctChg"].values
-            conditional[(from_day, to_day, regime)] = np.array(subset).flatten()
-
-    return conditional, week_regime
-
-
-def run_monte_carlo_conditional(
-    start_price: float,
-    conditional_spreads: dict,
-    mon_regime: str,
-    n_sims: int = N_SIMULATIONS,
-    seed: int = 99,
-) -> np.ndarray:
-    """
-    Same structure as run_monte_carlo but samples from the regime-specific
-    sub-buckets rather than the full unconditional distributions.
-    """
-    rng    = np.random.default_rng(seed)
-    n_cols = len(DAY_PAIRS) + 1
-    paths  = np.zeros((n_sims, n_cols))
-    paths[:, 0] = start_price
-
-    for col_idx, (from_day, to_day) in enumerate(DAY_PAIRS):
-        key   = (from_day, to_day, mon_regime)
-        moves = np.array(conditional_spreads.get(key, np.array([0.0]))).flatten()
-        if len(moves) < 5:
-            moves = np.array([0.0])  # too few data points — fall back to neutral
-        sampled_pct = rng.choice(moves, size=n_sims, replace=True)
-        paths[:, col_idx + 1] = paths[:, col_idx] * (1 + sampled_pct / 100)
-
-    return paths
+    df = df.sort_index()
+    n  = len(df)
+    transitions = []
+    for i in range(1, n):
+        prev_day = df["DayName"].iloc[i - 1]
+        curr_day = df["DayName"].iloc[i]
+        pair = (prev_day, curr_day)
+        if pair not in TRANSITION_TYPE_INDEX:
+            continue
+        type_idx = TRANSITION_TYPE_INDEX[pair]
+        from_price = df["Open"].iloc[i - 1] if prev_day == "Monday" else df["Close"].iloc[i - 1]
+        to_price   = df["Open"].iloc[i]     if curr_day == "Monday" else df["Close"].iloc[i]
+        pct = float((to_price - from_price) / from_price * 100)
+        transitions.append({
+            "type_idx":   type_idx,
+            "type_label": TRANSITION_TYPE_LABELS[type_idx],
+            "pct":        pct,
+            "date":       df.index[i],
+        })
+    return transitions
 
 
 # ─────────────────────────────────────────────
-# DYNAMIC THRESHOLD OPTIMIZATION
+# REGIME CLASSIFICATION
 # ─────────────────────────────────────────────
-def backtest_thresholds(df: pd.DataFrame, boundaries: list, labels: list) -> dict | None:
+def classify_regime(pct: float, lo: float, hi: float) -> str:
+    if pct < lo:
+        return "bear"
+    elif pct > hi:
+        return "bull"
+    return "flat"
+
+
+# ─────────────────────────────────────────────
+# PER-TYPE THRESHOLD OPTIMIZATION
+# ─────────────────────────────────────────────
+def build_type_occurrences(transitions: list, type_idx: int) -> pd.DataFrame:
     """
-    Leave-one-week-out backtest of a regime classification scheme.
-
-    For every historical week, the regime is classified from Monday's
-    open->close move, then that week's Tue/Wed/Thu/Fri outcome is predicted
-    using ONLY the *other* weeks in the same regime bucket (never itself —
-    no data leakage). Prediction error is scored via:
-      - MAE / RMSE of the median-predicted vs actual Friday close (%)
-      - Percentile calibration (does the P25/P50/P75/P95 band actually
-        contain the right fraction of real outcomes?)
-      - Brier score on simple OTM strike hit/miss (covered-call / secured-put
-        style probability calibration)
-
-    Returns a metrics dict, or None if any regime bucket has too few weeks
-    to be trustworthy.
+    For a given transition type, returns a DataFrame of (pct, next_pct)
+    pairs — next_pct being whatever transition immediately follows it in
+    the sequence (any type). This is the training data used to test
+    whether a candidate regime split on THIS type's pct is predictive of
+    what happens right after.
     """
-    df2 = df.copy()
-    df2["ISOWeek"] = df2.index.isocalendar().week.values
-    df2["ISOYear"] = df2.index.isocalendar().year.values
-    df2["WeekKey"] = df2["ISOYear"].astype(str) + "-" + df2["ISOWeek"].astype(str)
+    rows = []
+    for i, t in enumerate(transitions):
+        if t["type_idx"] != type_idx:
+            continue
+        if i + 1 >= len(transitions):
+            continue
+        rows.append({"pct": t["pct"], "next_pct": transitions[i + 1]["pct"]})
+    return pd.DataFrame(rows)
 
-    mon_days = df2[df2["DayName"] == "Monday"][["Open", "Close", "WeekKey"]].copy()
-    mon_days["MonRegimePct"] = ((mon_days["Close"] - mon_days["Open"]) / mon_days["Open"]) * 100
-    mon_days["Regime"] = mon_days["MonRegimePct"].apply(lambda p: classify_regime(p, boundaries, labels))
 
-    counts = mon_days["Regime"].value_counts()
-    for lbl in labels:
+def backtest_type_thresholds(occ_df: pd.DataFrame, lo: float, hi: float) -> dict | None:
+    """
+    Leave-one-out backtest using per-bucket MEAN (not median) for speed:
+    predicting each row's next_pct via the mean of the OTHER rows in its
+    same bucket, computed in O(n) via group sums rather than O(n^2).
+    Rejects the candidate if any bucket is too small to trust.
+    """
+    if occ_df.empty:
+        return None
+    df2 = occ_df.copy()
+    df2["bucket"] = df2["pct"].apply(lambda p: classify_regime(p, lo, hi))
+
+    counts = df2["bucket"].value_counts()
+    for lbl in REGIME_LABELS:
         if counts.get(lbl, 0) < MIN_BUCKET_SIZE:
-            return None  # this split starves a bucket of data — reject it
+            return None
 
-    wr_map = mon_days.set_index("WeekKey")["Regime"].to_dict()
+    grp        = df2.groupby("bucket")["next_pct"]
+    bucket_sum = grp.transform("sum")
+    bucket_n   = grp.transform("count")
+    loo_pred   = (bucket_sum - df2["next_pct"]) / (bucket_n - 1)
+    err        = df2["next_pct"] - loo_pred
 
-    weekday_pairs = DAY_PAIRS[1:]  # Mon->Tue ... Thu->Fri (weekend gap excluded — regime-independent)
+    return {
+        "mae":  float(err.abs().mean()),
+        "rmse": float(np.sqrt((err ** 2).mean())),
+        "n":    int(len(df2)),
+    }
 
-    # Per-week actual % move for each weekday transition
-    week_actual = {}
-    for from_day, to_day in weekday_pairs:
-        if from_day == "Monday":
-            from_rows = df2[df2["DayName"] == from_day][["Open", "WeekKey"]].rename(columns={"Open": "From"})
-        else:
-            from_rows = df2[df2["DayName"] == from_day][["Close", "WeekKey"]].rename(columns={"Close": "From"})
-        to_rows = df2[df2["DayName"] == to_day][["Close", "WeekKey"]].rename(columns={"Close": "To"})
-        merged  = pd.merge(from_rows, to_rows, on="WeekKey")
-        merged["Pct"] = (merged["To"] - merged["From"]) / merged["From"] * 100
-        for _, r in merged.iterrows():
-            week_actual.setdefault(r["WeekKey"], {})[(from_day, to_day)] = r["Pct"]
 
-    abs_errors, sq_errors = [], []
-    calib_hits  = {0.05: 0, 0.25: 0, 0.50: 0, 0.75: 0, 0.95: 0}
-    calib_total = 0
-    brier_scores = []
-    STRIKE_PCTS  = [0.02, 0.05, 0.10]
-    N_BOOT = 2000
-
-    for wk, actual_chain in week_actual.items():
-        if wk not in wr_map or len(actual_chain) < len(weekday_pairs):
-            continue
-        regime = wr_map[wk]
-
-        train_moves = {t: [] for t in weekday_pairs}
-        for other_wk, other_regime in wr_map.items():
-            if other_wk == wk or other_regime != regime:
+def optimize_type_thresholds(transitions: list, type_idx: int, verbose: bool = True) -> dict:
+    occ_df = build_type_occurrences(transitions, type_idx)
+    best = None
+    for lo in BEAR_GRID:
+        for hi in BULL_GRID:
+            metrics = backtest_type_thresholds(occ_df, lo, hi)
+            if metrics is None:
                 continue
-            other_chain = week_actual.get(other_wk, {})
-            for t in weekday_pairs:
-                if t in other_chain:
-                    train_moves[t].append(other_chain[t])
+            if best is None or metrics["rmse"] < best["rmse"]:
+                best = {"boundaries": [round(float(lo), 3), round(float(hi), 3)], **metrics}
 
-        if any(len(v) < 5 for v in train_moves.values()):
-            continue  # not enough leave-one-out training data for this week
-
-        pred_price   = 1.0
-        actual_price = 1.0
-        rng = np.random.default_rng(abs(hash(wk)) % (2**32))
-        sim_multiplier = np.ones(N_BOOT)
-
-        for t in weekday_pairs:
-            med_move = np.median(train_moves[t])
-            pred_price   *= (1 + med_move / 100)
-            actual_price *= (1 + actual_chain[t] / 100)
-            sampled = rng.choice(train_moves[t], size=N_BOOT, replace=True)
-            sim_multiplier *= (1 + sampled / 100)
-
-        err = actual_price - pred_price
-        abs_errors.append(abs(err))
-        sq_errors.append(err ** 2)
-
-        rank = np.mean(sim_multiplier < actual_price)
-        calib_total += 1
-        for q in calib_hits:
-            if rank <= q:
-                calib_hits[q] += 1
-
-        for pct in STRIKE_PCTS:
-            strike_up, strike_dn = 1 + pct, 1 - pct
-            p_up = np.mean(sim_multiplier > strike_up)
-            p_dn = np.mean(sim_multiplier < strike_dn)
-            brier_scores.append((p_up - float(actual_price > strike_up)) ** 2)
-            brier_scores.append((p_dn - float(actual_price < strike_dn)) ** 2)
-
-    if calib_total < MIN_BACKTEST_WEEKS:
-        return None
-
-    mae  = float(np.mean(abs_errors)) * 100
-    rmse = float(np.sqrt(np.mean(sq_errors))) * 100
-    calibration_error = float(np.mean([abs(calib_hits[q] / calib_total - q) for q in calib_hits]))
-    brier = float(np.mean(brier_scores))
-
-    return {"mae": mae, "rmse": rmse, "calibration_error": calibration_error,
-            "brier": brier, "n_weeks": calib_total}
-
-
-def optimize_regime_thresholds(df: pd.DataFrame, n_regimes: int = N_REGIMES, verbose: bool = True) -> dict | None:
-    """
-    Searches candidate regime boundary schemes and returns whichever
-    minimizes a composite backtest error score (lower = better):
-
-        score = RMSE(%) + 20 * calibration_error + 20 * brier
-
-    RMSE is already in % terms; calibration_error and brier are both in
-    [0,1], so the 20x weighting brings them onto a comparable scale to a
-    few-percent RMSE. Tune the weights if you want to favor one metric.
-    """
-    labels = REGIME_LABELS[n_regimes]
-
-    if n_regimes == 3:
-        candidates = [([b, u], {"bear": round(float(b), 2), "bull": round(float(u), 2)})
-                      for b in BEAR_GRID for u in BULL_GRID]
-    else:
-        template = np.array(REGIME_TEMPLATES[n_regimes])
-        candidates = [((template * s).round(3).tolist(), {"scale": round(float(s), 3)})
-                      for s in SCALE_GRID]
-
-    results = []
-    for boundaries, meta in candidates:
-        metrics = backtest_thresholds(df, boundaries, labels)
-        if metrics is None:
-            continue
-        score = metrics["rmse"] + 20 * metrics["calibration_error"] + 20 * metrics["brier"]
-        results.append({"boundaries": boundaries, "meta": meta, "score": score, **metrics})
-
-    if not results:
+    label = TRANSITION_TYPE_LABELS[type_idx]
+    if best is None:
+        best = {"boundaries": list(DEFAULT_BOUNDARIES), "mae": None, "rmse": None, "n": len(occ_df)}
         if verbose:
-            print("  WARNING: no threshold combination had enough data — falling back to defaults.")
-        return None
-
-    results.sort(key=lambda r: r["score"])
-    best = results[0]
-
-    if verbose:
-        print(f"  Tested {len(results)} valid threshold combinations (of {len(candidates)} candidates).")
-        print(f"  Best boundaries : {[round(b, 2) for b in best['boundaries']]}  ({', '.join(labels)})")
-        print(f"  RMSE            : {best['rmse']:.3f}%   MAE: {best['mae']:.3f}%")
-        print(f"  Calibration err : {best['calibration_error']:.3f}   Brier: {best['brier']:.3f}")
-        print(f"  Composite score : {best['score']:.3f}  (n={best['n_weeks']} backtested weeks)")
-
+            print(f"    {label:<10}  insufficient data (n={len(occ_df)}) — using default {DEFAULT_BOUNDARIES}")
+    elif verbose:
+        print(f"    {label:<10}  boundaries={best['boundaries']}  "
+              f"RMSE={best['rmse']:.3f}%  MAE={best['mae']:.3f}%  (n={best['n']})")
     return best
 
 
-def load_optimized_thresholds() -> dict:
+def optimize_all_thresholds(transitions: list, verbose: bool = True) -> dict:
+    return {i: optimize_type_thresholds(transitions, i, verbose) for i in range(N_TYPES)}
+
+
+def load_thresholds() -> dict:
     if os.path.exists(THRESHOLDS_FILE):
         with open(THRESHOLDS_FILE, "r") as f:
             return json.load(f)
     return {}
 
 
-def save_optimized_thresholds(all_thresholds: dict):
+def save_thresholds(all_thresholds: dict):
     with open(THRESHOLDS_FILE, "w") as f:
         json.dump(all_thresholds, f, indent=2)
 
 
-def get_ticker_boundaries(ticker: str, n_regimes: int, stored: dict) -> tuple:
-    """
-    Returns (boundaries, labels) for a ticker — uses cached optimized values
-    if present, otherwise falls back to the template default.
-    """
-    labels = REGIME_LABELS[n_regimes]
-    entry  = stored.get(ticker, {}).get(str(n_regimes))
-    if entry and "boundaries" in entry:
-        return entry["boundaries"], labels
-    return list(REGIME_TEMPLATES[n_regimes]), labels
+def get_thresholds_by_type(ticker: str, transitions: list, stored: dict) -> dict:
+    """Returns {type_idx: [lo, hi]} — optimized fresh, or loaded from cache/default."""
+    if OPTIMIZE_THRESHOLDS:
+        print(f"\n  Optimizing per-transition-type regime thresholds for {ticker}...")
+        type_results = optimize_all_thresholds(transitions)
+        if SAVE_OPTIMIZED_THRESHOLDS:
+            stored[ticker] = {
+                TRANSITION_TYPE_LABELS[i]: {
+                    "boundaries": type_results[i]["boundaries"],
+                    "mae":  type_results[i]["mae"],
+                    "rmse": type_results[i]["rmse"],
+                    "n":    type_results[i]["n"],
+                } for i in range(N_TYPES)
+            }
+            save_thresholds(stored)
+        return {i: type_results[i]["boundaries"] for i in range(N_TYPES)}
+
+    cached = stored.get(ticker, {})
+    out = {}
+    for i in range(N_TYPES):
+        entry = cached.get(TRANSITION_TYPE_LABELS[i])
+        out[i] = entry["boundaries"] if entry else list(DEFAULT_BOUNDARIES)
+    print(f"\n  Using cached/default thresholds for {ticker}: "
+          f"{{ {', '.join(f'{TRANSITION_TYPE_LABELS[i]}: {out[i]}' for i in range(N_TYPES))} }}")
+    return out
 
 
 # ─────────────────────────────────────────────
-# MON OPEN -> FRI CLOSE WEEKLY SPREAD
+# STATE INDEX  (9 states x 5 next-transition types)
+# ─────────────────────────────────────────────
+def build_state_index(transitions: list, thresholds_by_type: dict) -> tuple:
+    """
+    Classifies every transition into bear/flat/bull using its own type's
+    thresholds, then builds:
+      - state_map[(state_tuple, next_type_idx)] -> np.array of historical
+        % moves that occurred immediately after that state, for that type
+      - unconditional_by_type[type_idx] -> np.array of ALL historical %
+        moves of that type (fallback pool when a state is too thin)
+      - current_state = regimes of the two most recent transitions
+      - current_next_type_idx = type of the transition that comes next
+    """
+    regimes = [classify_regime(t["pct"], *thresholds_by_type[t["type_idx"]]) for t in transitions]
+
+    unconditional_by_type = defaultdict(list)
+    for t in transitions:
+        unconditional_by_type[t["type_idx"]].append(t["pct"])
+    unconditional_by_type = {k: np.array(v) for k, v in unconditional_by_type.items()}
+
+    state_map = defaultdict(list)
+    for i in range(1, len(transitions) - 1):
+        state_tuple   = (regimes[i - 1], regimes[i])
+        next_type_idx = transitions[i + 1]["type_idx"]
+        next_pct      = transitions[i + 1]["pct"]
+        state_map[(state_tuple, next_type_idx)].append(next_pct)
+    state_map = {k: np.array(v) for k, v in state_map.items()}
+
+    current_state         = (regimes[-2], regimes[-1])
+    current_next_type_idx = (transitions[-1]["type_idx"] + 1) % N_TYPES
+
+    return state_map, unconditional_by_type, regimes, current_state, current_next_type_idx
+
+
+def print_state_diagnostics(transitions: list, regimes: list):
+    counts    = defaultdict(int)
+    next_pcts = defaultdict(list)
+    for i in range(1, len(transitions) - 1):
+        st = (regimes[i - 1], regimes[i])
+        counts[st] += 1
+        next_pcts[st].append(transitions[i + 1]["pct"])
+
+    print(f"\n  {'-'*56}")
+    print(f"  9-State Occurrence Table  (prev regime, curr regime)")
+    print(f"  {'-'*56}")
+    print(f"  {'State':<22} {'N':>6}  {'Avg next move':>15}")
+    for prev in REGIME_LABELS:
+        for curr in REGIME_LABELS:
+            st = (prev, curr)
+            n  = counts.get(st, 0)
+            label = f"({prev}, {curr})"
+            if n > 0:
+                avg = np.mean(next_pcts[st])
+                print(f"  {label:<22} {n:>6}  {avg:>+14.2f}%")
+            else:
+                print(f"  {label:<22} {n:>6}  {'--':>15}")
+
+
+# ─────────────────────────────────────────────
+# STATE-CONDITIONAL MONTE CARLO
+# ─────────────────────────────────────────────
+def run_state_conditional_mc(
+    start_price: float,
+    current_state: tuple,
+    next_type_idx: int,
+    state_map: dict,
+    unconditional_by_type: dict,
+    thresholds_by_type: dict,
+    horizon: int,
+    n_sims: int = N_SIMULATIONS,
+    seed: int = 7,
+) -> np.ndarray:
+    """
+    Vectorized Markov-chain simulation. Every sim path tracks its own
+    (prev_regime, curr_regime) state. At each simulated day, paths are
+    grouped by their current state (<=9 groups), each group samples from
+    the historical pool matching (state, this day's transition type) —
+    falling back to the type's unconditional pool if that pool is too
+    thin (< MIN_STATE_SAMPLES). Each path's state is then updated from
+    its own sampled outcome, so paths diverge across the simulation.
+    """
+    rng = np.random.default_rng(seed)
+    regime_to_idx = {"bear": 0, "flat": 1, "bull": 2}
+    idx_to_regime = {v: k for k, v in regime_to_idx.items()}
+
+    paths = np.zeros((n_sims, horizon + 1))
+    paths[:, 0] = start_price
+
+    prev_regime_idx = np.full(n_sims, regime_to_idx[current_state[0]], dtype=np.int8)
+    curr_regime_idx = np.full(n_sims, regime_to_idx[current_state[1]], dtype=np.int8)
+
+    type_idx = next_type_idx
+    for day in range(1, horizon + 1):
+        sampled_pct  = np.empty(n_sims)
+        state_codes  = prev_regime_idx * 3 + curr_regime_idx
+
+        for code in np.unique(state_codes):
+            mask = state_codes == code
+            p_idx, c_idx = divmod(int(code), 3)
+            state_tuple = (idx_to_regime[p_idx], idx_to_regime[c_idx])
+
+            pool = state_map.get((state_tuple, type_idx))
+            if pool is None or len(pool) < MIN_STATE_SAMPLES:
+                pool = unconditional_by_type[type_idx]
+
+            sampled_pct[mask] = rng.choice(pool, size=int(mask.sum()), replace=True)
+
+        paths[:, day] = paths[:, day - 1] * (1 + sampled_pct / 100)
+
+        lo, hi = thresholds_by_type[type_idx]
+        new_regime_idx = np.where(sampled_pct < lo, 0, np.where(sampled_pct > hi, 2, 1)).astype(np.int8)
+        prev_regime_idx = curr_regime_idx
+        curr_regime_idx = new_regime_idx
+
+        type_idx = (type_idx + 1) % N_TYPES
+
+    return paths
+
+
+def summarize_forecast(paths: np.ndarray, horizon: int) -> pd.DataFrame:
+    rows = []
+    for d in range(horizon + 1):
+        prices = paths[:, d]
+        row = {"Day": d}
+        for p in CONFIDENCE:
+            row[f"p{int(p*100)}"] = np.percentile(prices, p * 100)
+        row["mean"] = np.mean(prices)
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("Day")
+
+
+# ─────────────────────────────────────────────
+# MON OPEN -> FRI CLOSE WEEKLY SPREAD  (unconditional baseline, unchanged)
 # ─────────────────────────────────────────────
 def compute_weekly_spread(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -553,25 +530,15 @@ def spread_stats(arr: np.ndarray) -> dict:
     }
 
 
-# ─────────────────────────────────────────────
-# MONTE CARLO (unconditional)
-# ─────────────────────────────────────────────
-def run_monte_carlo(
-    start_price: float,
-    spreads: dict,
-    n_sims: int = N_SIMULATIONS,
-    seed: int = 42,
-) -> np.ndarray:
+def run_monte_carlo(start_price: float, spreads: dict, n_sims: int = N_SIMULATIONS, seed: int = 42) -> np.ndarray:
     rng    = np.random.default_rng(seed)
     n_cols = len(DAY_PAIRS) + 1
     paths  = np.zeros((n_sims, n_cols))
     paths[:, 0] = start_price
-
     for col_idx, (from_day, to_day) in enumerate(DAY_PAIRS):
         historical_moves = np.array(spreads.get((from_day, to_day), np.array([0.0]))).flatten()
         sampled_pct = rng.choice(historical_moves, size=n_sims, replace=True)
         paths[:, col_idx + 1] = paths[:, col_idx] * (1 + sampled_pct / 100)
-
     return paths
 
 
@@ -588,17 +555,9 @@ def summarize_simulations(paths: np.ndarray) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
-# VISUALIZATION  (3 rows x 3 cols)
+# VISUALIZATION  (unconditional weekly chart, unchanged)
 # ─────────────────────────────────────────────
-def plot_ticker(
-    ticker: str,
-    start_price: float,
-    df: pd.DataFrame,
-    spreads: dict,
-    paths: np.ndarray,
-    sim_summary: pd.DataFrame,
-    weekly_spread: pd.DataFrame,
-):
+def plot_ticker(ticker, start_price, df, spreads, paths, sim_summary, weekly_spread):
     ws_s   = weekly_spread_stats(weekly_spread)
     ws_arr = np.array(weekly_spread["PctChange"]).flatten()
 
@@ -608,7 +567,6 @@ def plot_ticker(
         f"{ticker}  --  Monte Carlo Week Simulation  (prior Fri close: ${start_price:.2f})",
         fontsize=17, fontweight="bold", y=0.99,
     )
-
     gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.48, wspace=0.35)
 
     ax0 = fig.add_subplot(gs[0, :2])
@@ -758,7 +716,6 @@ def print_weekly_spread_table(ticker: str, weekly_spread: pd.DataFrame):
     print(f"    Finished week UP   > +5% : {ws['pct_up5']:.1f}%  of weeks")
     print(f"    Finished week DOWN < -2% : {ws['pct_down2']:.1f}%  of weeks")
     print(f"    Finished week DOWN < -5% : {ws['pct_down5']:.1f}%  of weeks")
-
     print(f"\n  Last 5 weeks:")
     for _, row in weekly_spread.tail(5).iterrows():
         arrow = "^" if row["PctChange"] >= 0 else "v"
@@ -768,115 +725,61 @@ def print_weekly_spread_table(ticker: str, weekly_spread: pd.DataFrame):
 
 
 def print_options_grid(ticker: str, start_price: float, fri: np.ndarray, label: str = ""):
-    """
-    Prints a granular +1% to +10% / -1% to -10% probability grid.
-    """
     tag = f"  [{label}]" if label else ""
-    print(f"\n  Options insights for Friday expiry{tag}  (start ${start_price:.2f}):")
+    print(f"\n  Options insights{tag}  (start ${start_price:.2f}):")
     print(f"  {'Strike':>10}  {'Move':>6}  {'Prob':>7}  Direction")
     print(f"  {'-'*42}")
-
     for pct in range(12, 0, -1):
         strike = start_price * (1 + pct / 100)
         prob   = np.mean(fri > strike) * 100
         bar    = "█" * int(prob / 2)
         print(f"  ${strike:>9.2f}  {f'+{pct}%':>6}  {prob:>6.1f}%  {bar}  <- covered call")
-
     print()
-
     for pct in range(1, 13):
         strike = start_price * (1 - pct / 100)
         prob   = np.mean(fri < strike) * 100
         bar    = "█" * int(prob / 2)
         print(f"  ${strike:>9.2f}  {f'-{pct}%':>6}  {prob:>6.1f}%  {bar}  <- secured put")
-
     p5_fri  = np.percentile(fri,  5)
     p95_fri = np.percentile(fri, 95)
     print(f"\n    Simulated 90% confidence range: ${p5_fri:.2f} - ${p95_fri:.2f}")
 
 
-def print_simulation_summary(ticker: str, start_price: float,
-                              sim_summary: pd.DataFrame, paths: np.ndarray):
+def print_simulation_summary(ticker: str, start_price: float, sim_summary: pd.DataFrame, paths: np.ndarray):
     print(f"\n{'='*66}")
-    print(f"  {ticker} -- Monte Carlo Simulation  (prior Fri close ${start_price:.2f})")
+    print(f"  {ticker} -- Unconditional Weekly Monte Carlo  (prior Fri close ${start_price:.2f})")
     print(f"{'='*66}")
     print(f"  {'Day':<16} {'P5 (bear)':>11} {'P25':>11} {'Median':>11} {'P75':>11} {'P95 (bull)':>11} {'Mean':>11}")
     print(f"  {'-'*66}")
-    labels = ["Fri* (prior close)", "Mon (open)", "Tue (close)",
-              "Wed (close)", "Thu (close)", "Fri (close)"]
+    labels = ["Fri* (prior close)", "Mon (open)", "Tue (close)", "Wed (close)", "Thu (close)", "Fri (close)"]
     for (day, row), lbl in zip(sim_summary.iterrows(), labels):
         print(f"  {lbl:<16}"
-              f"  ${row['p5']:>9.2f}"
-              f"  ${row['p25']:>9.2f}"
-              f"  ${row['p50']:>9.2f}"
-              f"  ${row['p75']:>9.2f}"
-              f"  ${row['p95']:>9.2f}"
-              f"  ${row['mean']:>9.2f}")
-
-    fri = paths[:, -1]
+              f"  ${row['p5']:>9.2f}  ${row['p25']:>9.2f}  ${row['p50']:>9.2f}"
+              f"  ${row['p75']:>9.2f}  ${row['p95']:>9.2f}  ${row['mean']:>9.2f}")
     if REPORT["options_grid"]:
-        print_options_grid(ticker, start_price, fri, label="Unconditional")
+        print_options_grid(ticker, start_price, paths[:, -1], label="Unconditional weekly")
 
 
-def print_conditional_summary(
-    ticker: str,
-    start_price: float,
-    conditional_spreads: dict,
-    week_regime: pd.DataFrame,
-    boundaries: list,
-    labels: list,
-):
+def print_forecast_summary(ticker: str, start_price: float, horizon: int,
+                            summary_df: pd.DataFrame, paths: np.ndarray):
     print(f"\n{'='*66}")
-    print(f"  {ticker} -- Conditional Sampling Analysis  ({len(labels)}-bucket regime)")
-    print(f"  Monday regime defined by Mon open->close % change:")
-    for i, regime in enumerate(labels):
-        print(f"    {REGIME_DISPLAY.get(regime, regime.upper()):<24} : {format_regime_range(boundaries, labels, i)}")
-    print(f"  (Fri->Mon weekend leg is unconditional — regime isn't known until Monday)")
+    print(f"  {ticker} -- State-Conditional Forecast  (+{horizon} trading day{'s' if horizon != 1 else ''})")
     print(f"{'='*66}")
-
-    for regime in labels:
-        regime_weeks = week_regime[week_regime["Regime"] == regime]
-        n_weeks = len(regime_weeks)
-        if n_weeks == 0:
-            continue
-
-        avg_mon_move = regime_weeks["MonRegimePct"].mean()
-        print(f"\n  {REGIME_DISPLAY.get(regime, regime.upper())}  "
-              f"({n_weeks} weeks, avg Mon move: {avg_mon_move:+.2f}%)")
-        print(f"  {'-'*62}")
-        print(f"  {'Transition':<16} {'N':>5} {'Mean%':>7} {'Std%':>7} "
-              f"{'P5%':>7} {'P25%':>7} {'P75%':>7} {'P95%':>7}")
-        print(f"  {'-'*62}")
-
-        for from_day, to_day in DAY_PAIRS:
-            key = (from_day, to_day, regime)
-            arr = conditional_spreads.get(key, np.array([]))
-            if len(arr) < 3:
-                print(f"  {from_day[:3]}->{to_day[:3]:<12}  (insufficient data: {len(arr)} weeks)")
-                continue
-            s = spread_stats(arr)
-            label = f"{from_day[:3]}->{to_day[:3]}"
-            note  = " *open" if from_day == "Monday" else (" *gap" if from_day == "Friday" else "")
-            print(f"  {label+note:<16} {s['n']:>5} {s['mean']:>7.2f} {s['std']:>7.2f} "
-                  f"{s['p5']:>7.2f} {s['p25']:>7.2f} {s['p75']:>7.2f} {s['p95']:>7.2f}")
-
-        if REPORT["options_grid"]:
-            cond_paths = run_monte_carlo_conditional(
-                start_price, conditional_spreads, regime, n_sims=N_SIMULATIONS
-            )
-            cond_fri = cond_paths[:, -1]
-            print_options_grid(ticker, start_price, cond_fri, label=REGIME_DISPLAY.get(regime, regime))
+    print(f"  {'Day':<8} {'P5':>10} {'P25':>10} {'Median':>10} {'P75':>10} {'P95':>10} {'Mean':>10}")
+    print(f"  {'-'*66}")
+    for day, row in summary_df.iterrows():
+        tag = "now" if day == 0 else f"+{day}"
+        print(f"  {tag:<8} ${row['p5']:>8.2f} ${row['p25']:>8.2f} ${row['p50']:>8.2f} "
+              f"${row['p75']:>8.2f} ${row['p95']:>8.2f} ${row['mean']:>8.2f}")
+    if REPORT["options_grid"]:
+        print_options_grid(ticker, start_price, paths[:, -1], label=f"+{horizon}d state-conditional")
 
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
-    custom_start_prices = {
-        "NVDA": None,
-        "WULF": None,
-        "SOFI": None,
-    }
+    custom_start_prices = {"NVDA": None, "WULF": None, "SOFI": None}
 
     for ticker in TICKERS:
         print(f"\n{'#'*66}")
@@ -888,25 +791,24 @@ def main():
             print(f"  ERROR: No data for {ticker}, skipping.")
             continue
 
+        # ── Unconditional weekly chain (prior Fri close -> next Fri close) ──
         if custom_start_prices.get(ticker) is not None:
-            start_price = float(custom_start_prices[ticker])
+            weekly_start_price = float(custom_start_prices[ticker])
         else:
             mondays = df[df["DayName"] == "Monday"]
-            start_price = None
+            weekly_start_price = None
             if not mondays.empty:
                 last_monday_date = mondays.index[-1]
                 pos = df.index.get_loc(last_monday_date)
                 if pos > 0 and df["DayName"].iloc[pos - 1] == "Friday":
-                    start_price = float(df["Close"].iloc[pos - 1])
+                    weekly_start_price = float(df["Close"].iloc[pos - 1])
                 else:
-                    start_price = float(mondays["Open"].iloc[-1])
-            if start_price is None:
-                start_price = float(df["Open"].iloc[-1])
+                    weekly_start_price = float(mondays["Open"].iloc[-1])
+            if weekly_start_price is None:
+                weekly_start_price = float(df["Open"].iloc[-1])
 
-        print(f"  Using start price : ${start_price:.2f}  (prior Friday close)")
         print(f"  Data range        : {df.index[0].date()} -> {df.index[-1].date()}  ({len(df)} trading days)")
 
-        # ── Unconditional analysis ───────────────────────────────────────
         spreads = compute_dow_spreads(df)
         if REPORT["spread_table"]:
             print_spread_table(ticker, spreads)
@@ -915,43 +817,49 @@ def main():
         if REPORT["weekly_summary"]:
             print_weekly_spread_table(ticker, weekly_spread)
 
-        paths       = run_monte_carlo(start_price, spreads)
-        sim_summary = summarize_simulations(paths)
-
+        weekly_paths = run_monte_carlo(weekly_start_price, spreads)
+        sim_summary  = summarize_simulations(weekly_paths)
         if REPORT["simulation_summary"]:
-            print_simulation_summary(ticker, start_price, sim_summary, paths)
+            print_simulation_summary(ticker, weekly_start_price, sim_summary, weekly_paths)
         if REPORT["charts"]:
-            plot_ticker(ticker, start_price, df, spreads, paths, sim_summary, weekly_spread)
+            plot_ticker(ticker, weekly_start_price, df, spreads, weekly_paths, sim_summary, weekly_spread)
 
-        # ── Conditional sampling analysis ────────────────────────────────
-        if REPORT["conditional_sampling"]:
-            stored = load_optimized_thresholds()
+        # ── State-conditional rolling forecast engine ────────────────────
+        if REPORT["state_forecast"]:
+            transitions = build_transition_sequence(df)
+            stored = load_thresholds()
+            thresholds_by_type = get_thresholds_by_type(ticker, transitions, stored)
 
-            if OPTIMIZE_THRESHOLDS:
-                print(f"\n  Optimizing regime thresholds for {ticker} ({N_REGIMES}-bucket)...")
-                best = optimize_regime_thresholds(df, N_REGIMES)
-                if best is not None:
-                    boundaries, labels = best["boundaries"], REGIME_LABELS[N_REGIMES]
-                    if SAVE_OPTIMIZED_THRESHOLDS:
-                        stored.setdefault(ticker, {})[str(N_REGIMES)] = {
-                            "boundaries": boundaries,
-                            "labels": labels,
-                            "metrics": {k: best[k] for k in
-                                        ("mae", "rmse", "calibration_error", "brier", "n_weeks", "score")},
-                        }
-                        save_optimized_thresholds(stored)
-                else:
-                    boundaries, labels = get_ticker_boundaries(ticker, N_REGIMES, stored)
-            else:
-                boundaries, labels = get_ticker_boundaries(ticker, N_REGIMES, stored)
-                print(f"\n  Using cached/default thresholds for {ticker}: "
-                      f"{[round(b, 2) for b in boundaries]}")
+            state_map, unconditional_by_type, regimes, current_state, current_next_type_idx = \
+                build_state_index(transitions, thresholds_by_type)
 
-            conditional_spreads, week_regime = compute_conditional_spreads(df, boundaries, labels)
-            print_conditional_summary(ticker, start_price, conditional_spreads, week_regime, boundaries, labels)
+            print(f"\n{'='*66}")
+            print(f"  {ticker} -- Current Market State")
+            print(f"{'='*66}")
+            print(f"  As of              : {transitions[-1]['date'].date()}")
+            print(f"  Current state       : (prev={current_state[0].upper()}, curr={current_state[1].upper()})")
+            print(f"  Next transition type: {TRANSITION_TYPE_LABELS[current_next_type_idx]}")
+            print(f"  Optimized thresholds:")
+            for i in range(N_TYPES):
+                lo, hi = thresholds_by_type[i]
+                print(f"    {TRANSITION_TYPE_LABELS[i]:<10}  Bear < {lo:+.2f}%   Bull > {hi:+.2f}%")
+
+            if REPORT["state_diagnostics"]:
+                print_state_diagnostics(transitions, regimes)
+
+            state_start_price = float(df["Close"].iloc[-1])
+            for horizon in FORECAST_HORIZONS:
+                paths = run_state_conditional_mc(
+                    state_start_price, current_state, current_next_type_idx,
+                    state_map, unconditional_by_type, thresholds_by_type,
+                    horizon, n_sims=N_SIMULATIONS,
+                )
+                summary_df = summarize_forecast(paths, horizon)
+                print_forecast_summary(ticker, state_start_price, horizon, summary_df, paths)
+
             print(f"\n\n\n\n{'#'*66}")
 
-    print(f"\nDone! Charts saved as PNG files in the current directory.\n")
+    print(f"\nDone!\n")
 
 
 if __name__ == "__main__":
