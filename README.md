@@ -1,65 +1,322 @@
-Stock Monte Carlo Simulator
+# Stock State-Based Monte Carlo Forecasting Engine
 
-Uses 3 years of historical price data to simulate where a stock might close by Friday — built for options traders placing covered calls and cash-secured puts.
+A probabilistic forecasting engine that uses historical market behavior and state-aware Monte Carlo simulation to estimate future stock price distributions. Designed primarily for selecting optimal **covered call** and **cash-secured put** strikes.
 
+---
 
-What it does
-You give it a stock ticker and a Monday opening price. It analyzes 3 years of historical day-to-day moves and runs 10 million simulated weeks to show you the probability distribution of where the stock lands each day through Friday close.
-The output answers questions like:
+# Overview
 
-"What's the probability NVDA closes above $185 by Friday?" → helps you pick a covered call strike
-"What's the probability SOFI drops below $12 by Friday?" → helps you pick a cash-secured put strike
-"Monday was a strong up day — does that change the rest of the week?" → yes, and the conditional analysis shows you how
+Instead of assuming stock prices follow a normal distribution, this project learns directly from historical trading behavior.
 
+Given a stock ticker and the current market price, it estimates the probability distribution of future prices over the next **1–5 trading days** using millions of Monte Carlo simulations conditioned on similar historical market states.
 
-How it works
-Step 1 — Build historical distributions
-For each day transition (Mon→Tue, Tue→Wed, etc.), it collects every historical instance of that move over the past 3 years. Monday uses the open price as the entry point since that's when you'd place your trade.
-Step 2 — Monte Carlo simulation
-It randomly samples from those real historical distributions 10 million times, chaining Mon→Tue→Wed→Thu→Fri to generate 10 million simulated weeks. No assumptions about bell curves — it uses the actual shape of each distribution including fat tails and skew.
-Step 3 — Conditional sampling
-Weeks are bucketed by how Monday behaved (bear / flat / bull). Each regime gets its own separate simulation, capturing momentum and mean-reversion effects.
+The goal is not to predict a single future price.
 
- Options insights for Friday expiry  [Unconditional]  (Mon open $174.80):
-      Strike    Move     Prob  Direction
-  ------------------------------------------
-  $   195.78    +12%     5.7%  ██  <- covered call 
-  
-  $   194.03    +11%     7.1%  ███  <- covered call 
-  
-  $   192.28    +10%     8.9%  ████  <- covered call 
-  
-  $   190.53     +9%    11.2%  █████  <- covered call 
-  
-  $   162.56     -7%     7.2%  ███  <- secured put 
-  
-  $   160.82     -8%     5.1%  ██  <- secured put 
-  
-  $   159.07     -9%     3.5%  █  <- secured put 
-  
-  $   157.32    -10%     2.4%  █  <- secured put  
-  
+The goal is to estimate the **entire probability distribution** of possible outcomes.
 
-  Simulated 90% confidence range: $14.82 - $19.91
+This allows traders to answer questions such as:
 
-Setup
-bashpip install yfinance pandas numpy matplotlib scipy
+* What is the probability NVDA finishes above my covered call strike?
+* What is the probability SOFI finishes below my cash-secured put strike?
+* How likely is the stock to remain within my desired range?
+* How much uncertainty exists over the next trading week?
+
+---
+
+# Key Features
+
+* State-aware Monte Carlo simulation
+* Dynamic historical sampling
+* Second-order market state model
+* Automatic regime optimization
+* Multi-day probability forecasts (+1 through +5 trading days)
+* Covered call and cash-secured put probability analysis
+* Historical model evaluation and calibration (planned)
+
+---
+
+# How It Works
+
+## Step 1 — Collect Historical Transitions
+
+Download approximately three years of daily market data using Yahoo Finance.
+
+Historical returns are separated into individual trading-day transitions:
+
+```text
+Friday Close  → Monday Open
+Monday Open   → Tuesday Close
+Tuesday Close → Wednesday Close
+Wednesday Close → Thursday Close
+Thursday Close → Friday Close
+```
+
+Each transition maintains its own empirical return distribution.
+
+No assumptions are made about return shape.
+
+Historical skew, fat tails, and volatility clustering are preserved.
+
+---
+
+## Step 2 — Learn Market States
+
+Rather than treating every historical week equally, the model identifies the current market environment.
+
+The current implementation uses a **second-order state model**.
+
+Each completed trading-day transition is classified into one of three regimes:
+
+* Bear
+* Flat
+* Bull
+
+The previous two completed transitions determine the current market state.
+
+Example:
+
+```text
+Previous Transition : Bear
+
+Current Transition  : Bull
+
+↓
+
+Current State = (Bear, Bull)
+```
+
+This produces nine possible market states:
+
+```text
+Bear Bear
+Bear Flat
+Bear Bull
+
+Flat Bear
+Flat Flat
+Flat Bull
+
+Bull Bear
+Bull Flat
+Bull Bull
+```
+
+Unlike earlier versions, the market state is **not tied to Monday**.
+
+The simulator works from any trading day by evaluating the two most recent completed transitions.
+
+---
+
+## Step 3 — Dynamic Regime Optimization
+
+Bear/Flat/Bull thresholds are **not hardcoded**.
+
+For every transition type, the model automatically searches thousands of candidate threshold combinations and evaluates them using historical leave-one-week-out backtesting.
+
+The thresholds producing the lowest prediction error are selected and cached.
+
+This allows every stock to develop its own optimal regime definitions.
+
+Example:
+
+```text
+NVDA
+
+Bear < -2.7%
+
+Bull > +2.1%
+```
+
+```text
+SOFI
+
+Bear < -1.3%
+
+Bull > +1.4%
+```
+
+---
+
+## Step 4 — State-Aware Monte Carlo Simulation
+
+The simulation begins from the current trading day.
+
+Instead of sampling randomly from all historical observations, it only samples from historical periods matching the current market state.
+
+Each simulated transition updates the market state before generating the next transition.
+
+This creates a path-dependent Monte Carlo process that captures momentum and mean-reversion more realistically than unconditional sampling.
+
+Millions of simulated price paths are generated to estimate the full probability distribution.
+
+---
+
+## Step 5 — Multi-Day Forecasts
+
+Forecasts are generated for the next five trading days.
+
+Each forecast includes:
+
+* Expected price
+* Median
+* Standard deviation
+* Confidence intervals
+* Full probability distribution
+
+Forecast horizons automatically adjust based on the current day.
+
+For example:
+
+If today is Wednesday:
+
+```text
+Thursday
+
+Friday
+
+Monday
+
+Tuesday
+
+Wednesday
+```
+
+If today is Friday:
+
+```text
+Monday
+
+Tuesday
+
+Wednesday
+
+Thursday
+
+Friday
+```
+
+The model is designed to produce useful forecasts regardless of when it is executed.
+
+---
+
+# Option Analysis
+
+Using the simulated distributions, the engine estimates assignment probabilities for common option strikes.
+
+Example:
+
+```text
+Covered Call
+
+Strike
+
+$195
+
+Probability of Assignment
+
+7.4%
+```
+
+```text
+Cash-Secured Put
+
+Strike
+
+$165
+
+Probability of Assignment
+
+5.1%
+```
+
+Rather than estimating option prices, the model estimates the probability of finishing beyond each strike.
+
+This helps identify attractive risk/reward opportunities for premium selling strategies.
+
+---
+
+# Planned Features
+
+## Model Evaluation Framework
+
+Every model revision will be evaluated using historical walk-forward testing.
+
+Metrics include:
+
+* +1 day forecast accuracy
+* +3 day forecast accuracy
+* +5 day forecast accuracy
+* Calibration of confidence intervals
+* Covered-call assignment probability accuracy
+* Cash-secured put assignment probability accuracy
+
+The evaluation framework will determine whether new features genuinely improve predictive performance before they are adopted.
+
+---
+
+## Future Research
+
+Potential future enhancements include:
+
+* Hidden Markov Models (HMMs)
+* Regime-switching models
+* Volatility-aware state variables
+* SPY trend conditioning
+* VIX conditioning
+* Trading volume features
+* ATR and momentum indicators
+
+These features will only be incorporated if they demonstrate measurable improvements during historical backtesting.
+
+---
+
+# Installation
+
+```bash
+pip install yfinance pandas numpy matplotlib scipy
+```
+
+Run:
+
+```bash
 python stock_monte_carlo.py
+```
 
-Configuration
-At the top of stock_monte_carlo.py:
-VariableDefaultDescriptionTICKERS["NVDA", "WULF", "SOFI"]Stocks to analyzeLOOKBACK_YEARS3Years of historical data to useN_SIMULATIONS10,000,000Monte Carlo paths (reduce to 10_000 for quick runs)MON_REGIME_THRESHOLDS(-1.0, +1.0)% thresholds defining bear/flat/bull Monday
-To set a specific Monday open price instead of pulling the latest:
-pythoncustom_start_prices = {
-    "NVDA": 182.00,   # pin a specific price
-    "WULF": None,     # None = use latest Monday open from yfinance
-}
+---
 
-Output per ticker
+# Configuration
 
-PNG chart — 6-panel visualization saved as {TICKER}_monte_carlo.png
-Console report — spread tables, weekly Mon→Fri history, simulation summary, and the full +1% to +12% / -1% to -12% options probability grid for each regime
+Primary configuration options include:
 
+* Stock tickers
+* Historical lookback period
+* Number of Monte Carlo simulations
+* Custom starting prices
+* Report modules
+* Forecast horizon
 
-Disclaimer
-This is a personal research tool, not financial advice. Past distributions don't guarantee future returns. Always do your own due diligence before placing any options trade.
+The simulator is designed to support both quick exploratory runs and large-scale research experiments.
+
+---
+
+# Philosophy
+
+This project is built around one guiding principle:
+
+> Historical market behavior contains useful probabilistic information.
+
+Rather than attempting to predict a single future price, the objective is to estimate a realistic probability distribution conditioned on similar historical market environments.
+
+Every new feature is evaluated quantitatively through historical backtesting.
+
+If a feature does not improve forecasting performance, it is removed.
+
+---
+
+# Disclaimer
+
+This software is intended for educational and research purposes only.
+
+It does not provide financial advice or guarantee future investment performance.
+
+Historical market behavior does not guarantee future results, and all investment decisions should be made independently after appropriate due diligence.
