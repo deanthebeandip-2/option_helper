@@ -279,7 +279,7 @@ pip install yfinance pandas numpy matplotlib scipy
 Run:
 
 ```bash
-python stock_monte_carlo.py
+python option_helper_draft1.py
 ```
 
 ---
