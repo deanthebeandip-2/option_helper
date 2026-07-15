@@ -16,8 +16,9 @@ Core idea:
     simulated day, every path samples its next move from historical
     observations that occurred in ITS current state, then the path's
     state updates based on what was sampled. Paths diverge over time.
-  - Supports arbitrary rolling forecast horizons (+1, +3, +5, +10... days)
-    from whatever the most recent close is, on any day of the week.
+  - Supports rolling forecast horizons +1 through +5 trading days,
+    labeled with actual calendar dates, from whatever the most recent
+    close is, on any day of the week.
 
 Install deps:
     pip install yfinance pandas numpy matplotlib scipy
@@ -42,13 +43,13 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-#TICKERS        = ["SOFI"]
-TICKERS        = ["SOFI", "CRWV", "NVDA", "WULF", "HOOD"]
+TICKERS        = ["SOFI"]
+#TICKERS        = ["SOFI", "CRWV", "NVDA", "WULF", "HOOD"]
 LOOKBACK_YEARS = 10
 N_SIMULATIONS  = 1_000_000
 #N_SIMULATIONS  = 10_000
 CONFIDENCE     = [0.05, 0.25, 0.50, 0.75, 0.95]
-FORECAST_HORIZONS = [1, 3, 5, 10]     # rolling forecast horizons, in trading days
+FORECAST_HORIZONS = [1, 2, 3, 4, 5]     # rolling forecast horizons, in trading days
 
 
 # ─────────────────────────────────────────────
@@ -61,8 +62,8 @@ REPORT = {
     "weekly_summary": 1,        # useful, still Mon open -> Fri close (unconditional)
     "simulation_summary": True, # unconditional weekly Monte Carlo
     "options_grid": True,       # used by both weekly and state-forecast sections
-    "state_forecast": True,     # NEW: state-conditional rolling forecast engine
-    "state_diagnostics": True,  # NEW: print the 9-state occurrence table
+    "state_forecast": True,     # state-conditional rolling forecast engine
+    "state_diagnostics": True,  # print the 9-state occurrence table
 
     # Graphics
     "charts": False,            # unconditional weekly chart only
@@ -102,6 +103,10 @@ MIN_STATE_SAMPLES = 20   # min (state, next_type) pool size before falling back 
 BEAR_GRID = np.arange(-5.0, -0.24, 0.25)   # -5.00 ... -0.25
 BULL_GRID = np.arange(0.25, 5.01, 0.25)    # +0.25 ... +5.00
 
+# ── Options grid display settings ────────────────────────────────────────
+MIN_DISPLAY_PROB = 0.1   # rows with prob <= this (in %) are cut off
+MAX_STRIKE_PCT   = 60      # safety cap so a degenerate distribution can't loop forever
+
 # Palette
 C_BEAR   = "#d73027"
 C_BULL   = "#313695"
@@ -127,6 +132,29 @@ def fetch_data(ticker: str, years: int = LOOKBACK_YEARS) -> pd.DataFrame:
     df.index    = pd.to_datetime(df.index)
     df["DayName"] = df.index.day_name()
     return df.dropna().sort_index()
+
+
+# ─────────────────────────────────────────────
+# TRADING-DATE HELPER  (for forecast labels)
+# ─────────────────────────────────────────────
+def future_trading_date(last_date, n_days: int):
+    """
+    Returns the calendar date N *trading* days after last_date, skipping
+    weekends via numpy's business-day calendar. No holiday calendar is
+    applied (same limitation as the simulation's Mon-Tue-Wed-Thu-Fri
+    cycle itself, which also doesn't account for market holidays) — so
+    around holidays the label may be off by a day or two versus the
+    exchange's actual calendar.
+    """
+    if n_days == 0:
+        return pd.Timestamp(last_date).date()
+    base = np.datetime64(pd.Timestamp(last_date).date(), 'D')
+    result = np.busday_offset(base, n_days, roll='forward')
+    return pd.Timestamp(result).date()
+
+
+def format_date_short(d) -> str:
+    return f"{d.month}/{d.day}"
 
 
 # ─────────────────────────────────────────────
@@ -712,10 +740,10 @@ def print_weekly_spread_table(ticker: str, weekly_spread: pd.DataFrame):
     print(f"          P90 : {ws['p90']:+.2f}%")
     print(f"          P95 : {ws['p95']:+.2f}%")
     print(f"\n  Tail probabilities (historical base rates):")
+    print(f"    Finished week DOWN < -5% : {ws['pct_down5']:.1f}%  of weeks")
+    print(f"    Finished week DOWN < -2% : {ws['pct_down2']:.1f}%  of weeks")
     print(f"    Finished week UP   > +2% : {ws['pct_up2']:.1f}%  of weeks")
     print(f"    Finished week UP   > +5% : {ws['pct_up5']:.1f}%  of weeks")
-    print(f"    Finished week DOWN < -2% : {ws['pct_down2']:.1f}%  of weeks")
-    print(f"    Finished week DOWN < -5% : {ws['pct_down5']:.1f}%  of weeks")
     print(f"\n  Last 5 weeks:")
     for _, row in weekly_spread.tail(5).iterrows():
         arrow = "^" if row["PctChange"] >= 0 else "v"
@@ -725,21 +753,52 @@ def print_weekly_spread_table(ticker: str, weekly_spread: pd.DataFrame):
 
 
 def print_options_grid(ticker: str, start_price: float, fri: np.ndarray, label: str = ""):
+    """
+    Dynamic-range options grid. Instead of a fixed +-12% window, walks
+    outward one percent at a time on each side and keeps going as long
+    as probability stays above MIN_DISPLAY_PROB — so a calm stock won't
+    show a wall of 0.0% rows, and a volatile stock will show its full
+    tail instead of getting clipped at +-12%.
+    """
     tag = f"  [{label}]" if label else ""
     print(f"\n  Options insights{tag}  (start ${start_price:.2f}):")
     print(f"  {'Strike':>10}  {'Move':>6}  {'Prob':>7}  Direction")
     print(f"  {'-'*42}")
-    for pct in range(12, 0, -1):
+
+    # Upside (covered call zone) — walk +1%, +2%, ... until prob drops out
+    call_rows = []
+    pct = 1
+    while pct < MAX_STRIKE_PCT:
         strike = start_price * (1 + pct / 100)
         prob   = np.mean(fri > strike) * 100
-        bar    = "█" * int(prob / 2)
+        if prob <= MIN_DISPLAY_PROB:
+            break
+        call_rows.append((pct, strike, prob))
+        pct += 1
+
+    for pct, strike, prob in reversed(call_rows):
+        bar = "█" * int(prob / 2)
         print(f"  ${strike:>9.2f}  {f'+{pct}%':>6}  {prob:>6.1f}%  {bar}  <- covered call")
+
     print()
-    for pct in range(1, 13):
+
+    # Downside (secured put zone) — walk -1%, -2%, ... until prob drops out
+    put_rows = []
+    pct = 1
+    while pct < MAX_STRIKE_PCT:
         strike = start_price * (1 - pct / 100)
-        prob   = np.mean(fri < strike) * 100
-        bar    = "█" * int(prob / 2)
+        if strike <= 0:
+            break
+        prob = np.mean(fri < strike) * 100
+        if prob <= MIN_DISPLAY_PROB:
+            break
+        put_rows.append((pct, strike, prob))
+        pct += 1
+
+    for pct, strike, prob in put_rows:
+        bar = "█" * int(prob / 2)
         print(f"  ${strike:>9.2f}  {f'-{pct}%':>6}  {prob:>6.1f}%  {bar}  <- secured put")
+
     p5_fri  = np.percentile(fri,  5)
     p95_fri = np.percentile(fri, 95)
     print(f"\n    Simulated 90% confidence range: ${p5_fri:.2f} - ${p95_fri:.2f}")
@@ -761,18 +820,22 @@ def print_simulation_summary(ticker: str, start_price: float, sim_summary: pd.Da
 
 
 def print_forecast_summary(ticker: str, start_price: float, horizon: int,
-                            summary_df: pd.DataFrame, paths: np.ndarray):
+                            summary_df: pd.DataFrame, paths: np.ndarray, last_date):
     print(f"\n{'='*66}")
     print(f"  {ticker} -- State-Conditional Forecast  (+{horizon} trading day{'s' if horizon != 1 else ''})")
     print(f"{'='*66}")
-    print(f"  {'Day':<8} {'P5':>10} {'P25':>10} {'Median':>10} {'P75':>10} {'P95':>10} {'Mean':>10}")
+    print(f"  {'Date':<8} {'P5':>10} {'P25':>10} {'Median':>10} {'P75':>10} {'P95':>10} {'Mean':>10}")
     print(f"  {'-'*66}")
     for day, row in summary_df.iterrows():
-        tag = "now" if day == 0 else f"+{day}"
+        if day == 0:
+            tag = "now"
+        else:
+            tag = format_date_short(future_trading_date(last_date, day))
         print(f"  {tag:<8} ${row['p5']:>8.2f} ${row['p25']:>8.2f} ${row['p50']:>8.2f} "
               f"${row['p75']:>8.2f} ${row['p95']:>8.2f} ${row['mean']:>8.2f}")
+    target_date = format_date_short(future_trading_date(last_date, horizon))
     if REPORT["options_grid"]:
-        print_options_grid(ticker, start_price, paths[:, -1], label=f"+{horizon}d state-conditional")
+        print_options_grid(ticker, start_price, paths[:, -1], label=f"{target_date} state-conditional (+{horizon}d)")
 
 
 # ─────────────────────────────────────────────
@@ -833,6 +896,8 @@ def main():
             state_map, unconditional_by_type, regimes, current_state, current_next_type_idx = \
                 build_state_index(transitions, thresholds_by_type)
 
+            last_date = df.index[-1]
+
             print(f"\n{'='*66}")
             print(f"  {ticker} -- Current Market State")
             print(f"{'='*66}")
@@ -855,7 +920,7 @@ def main():
                     horizon, n_sims=N_SIMULATIONS,
                 )
                 summary_df = summarize_forecast(paths, horizon)
-                print_forecast_summary(ticker, state_start_price, horizon, summary_df, paths)
+                print_forecast_summary(ticker, state_start_price, horizon, summary_df, paths, last_date)
 
             print(f"\n\n\n\n{'#'*66}")
 
