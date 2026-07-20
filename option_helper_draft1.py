@@ -37,6 +37,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import json
 import os
+import time
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -71,6 +72,9 @@ REPORT = {
     # Future modules
     "backtesting": False,
     "live_analysis": False,
+
+    # Calibration backtest (runs after the normal per-ticker report)
+    "calibration_backtest": True,
 }
 
 # The 5-transition weekly cycle. Order matters — it defines both the
@@ -103,9 +107,71 @@ MIN_STATE_SAMPLES = 20   # min (state, next_type) pool size before falling back 
 BEAR_GRID = np.arange(-5.0, -0.24, 0.25)   # -5.00 ... -0.25
 BULL_GRID = np.arange(0.25, 5.01, 0.25)    # +0.25 ... +5.00
 
+# ── Threshold Optimizer scoring (evaluator-driven, not raw-error-driven) ──
+# Philosophy change: thresholds are no longer picked by whichever (lo, hi)
+# minimizes prediction error. Each candidate (lo, hi) is scored by
+# evaluate_threshold_candidate() on three axes — calibration, directional
+# assignment accuracy, and 1-day forecast error — combined into one Overall
+# Score, and optimize_type_thresholds() keeps whichever candidate maximizes
+# that score. See evaluate_threshold_candidate()'s docstring for the exact
+# method and its cost tradeoff vs. a full Monte-Carlo walk-forward per
+# candidate.
+SCORE_WEIGHTS = {
+    "calibration": 0.50,
+    "assignment":  0.30,
+    "mae":         0.20,
+}
+CALIBRATION_TARGET_CI      = 0.90   # the CI level the calibration term is scored against
+CALIBRATION_TRAIN_FRACTION = 0.6    # chronological train/test split within each bucket
+
+# ── Optimizer mode ────────────────────────────────────────────────────────
+# "full": THE redesign. The Threshold Optimizer calls the real Monte Carlo
+#         engine hundreds of times (once per candidate, walked forward through
+#         history) — thresholds are chosen because they make the ENGINE's
+#         forecasts best, exactly per the "Threshold Optimizer -> calls ->
+#         Evaluator" architecture. Slow (minutes), faithful to the design.
+# "fast": the lightweight proxy — scores each candidate against the type's
+#         historical (pct, next_pct) pool directly, no Monte Carlo re-run.
+#         Seconds, not minutes. Useful as a quick sanity check or fallback.
+OPTIMIZER_MODE = "full"
+
+# Cost/precision knobs for "full" mode. Total evaluator calls ~=
+# coord_ascent_passes x N_TYPES x len(bear_grid) x len(bull_grid), and each
+# call itself walks forward through roughly
+# (n_trading_days - min_history_days) / stride historical points, running a
+# real (small) Monte Carlo simulation at each one. Tune these down for a
+# quick pass, up for a more precise (much slower) one.
+FULL_EVALUATOR_CONFIG = {
+    "n_sims":              400,                          # sims per walk-forward day inside the search (<< live N_SIMULATIONS)
+    "stride":              25,                            # historical days skipped between walk-forward evals
+    "min_history_days":    400,                           # need this much history before the first eval point
+    "horizons":            [1, 3, 5],                     # subset of FORECAST_HORIZONS scored inside the search (calibration)
+    "confidence_levels":   [0.50, 0.75, 0.90, 0.95],       # unused directly by scoring (single CALIBRATION_TARGET_CI drives
+                                                            # the score) but recorded for future use / diagnostics
+    "coord_ascent_passes": 1,                              # full passes over all 5 types; raise to 2-3 to let types converge
+    "bear_grid":           np.arange(-4.0, -0.49, 0.75),   # coarser than the fast-mode grid — each point is expensive here
+    "bull_grid":           np.arange(0.5, 4.01, 0.75),
+}
+
 # ── Options grid display settings ────────────────────────────────────────
-MIN_DISPLAY_PROB = 0.1   # rows with prob <= this (in %) are cut off
+MIN_DISPLAY_PROB = 1.99   # rows with prob <= this (in %) are cut off
 MAX_STRIKE_PCT   = 60      # safety cap so a degenerate distribution can't loop forever
+
+# ── Calibration backtest settings ────────────────────────────────────────
+# Walks back through history, pretends each sampled day is "today", rebuilds
+# the model from ONLY the data available as of that day, runs the normal
+# +1..+5 state-conditional forecast, and checks whether the actual future
+# close fell inside the predicted confidence interval. This never touches
+# the live forecasting logic above — it just calls the same functions with
+# a truncated dataframe.
+BACKTEST_CONFIG = {
+    "n_sims":           2_000,   # smaller than live N_SIMULATIONS — this runs hundreds of times
+    "stride":           5,       # evaluate every Nth trading day (1 = every day, slow)
+    "min_history_days": 500,     # need enough history before the first eval day
+    "confidence_levels": [0.50, 0.75, 0.90, 0.95],
+    "assessment_ci":    0.90,    # which CI drives the pass/fail "Overall Assessment" line
+    "tolerance_pts":    3.0,     # +/- percentage points considered "well calibrated"
+}
 
 # Palette
 C_BEAR   = "#d73027"
@@ -268,12 +334,42 @@ def build_type_occurrences(transitions: list, type_idx: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def backtest_type_thresholds(occ_df: pd.DataFrame, lo: float, hi: float) -> dict | None:
+def evaluate_threshold_candidate(occ_df: pd.DataFrame, lo: float, hi: float) -> dict | None:
     """
-    Leave-one-out backtest using per-bucket MEAN (not median) for speed:
-    predicting each row's next_pct via the mean of the OTHER rows in its
-    same bucket, computed in O(n) via group sums rather than O(n^2).
-    Rejects the candidate if any bucket is too small to trust.
+    THE EVALUATOR. Given a candidate (lo, hi) threshold pair, returns a
+    dict with an "overall_score" (0-100). optimize_type_thresholds() picks
+    the candidate that maximizes this score — thresholds are chosen because
+    they make the forecasting engine perform best, not because the split
+    itself "looks like" a good bear/bull boundary.
+
+    Three sub-scores (each 0-1), combined via SCORE_WEIGHTS:
+
+      - calibration_score: buckets each row bear/flat/bull under (lo, hi),
+        then for each bucket does a chronological train/test split
+        (CALIBRATION_TRAIN_FRACTION) — builds the CALIBRATION_TARGET_CI
+        interval (e.g. 90% -> 5th/95th percentile) from the train slice
+        only, and checks how often the test slice's actual next_pct falls
+        inside it. Score = 1 - |observed - target| / target.
+
+      - assignment_score: does the bucket's out-of-sample (leave-one-out)
+        predicted direction match the actual next-day direction? This is a
+        proxy for "did the regime call point the right way" — not a full
+        state-machine assignment accuracy (that would require re-running
+        the 9-state Monte Carlo per candidate; see note below).
+
+      - mae_score: 1-day leave-one-out MAE, normalized against a naive
+        "always predict the bucket-free overall mean" baseline, so 1.0 =
+        perfect, 0.0 = no better than guessing the mean.
+
+    COST NOTE: this scores each candidate against the per-type historical
+    pool directly (same O(n) cost class as the old RMSE-only backtest —
+    fast enough for a ~400-point grid x 5 transition types). It does NOT
+    re-run the full state-conditional Monte Carlo engine per candidate,
+    which the literal "run 1,200 historical MC backtests per candidate"
+    design would require — that's roughly 2,000 full walk-forward runs and
+    would take hours rather than seconds. If you want that heavier, more
+    literal version later, run_calibration_backtest()/evaluate_calibration_for_ticker()
+    (added earlier) is the piece to call from inside this function instead.
     """
     if occ_df.empty:
         return None
@@ -285,16 +381,60 @@ def backtest_type_thresholds(occ_df: pd.DataFrame, lo: float, hi: float) -> dict
         if counts.get(lbl, 0) < MIN_BUCKET_SIZE:
             return None
 
+    # ── Leave-one-out MAE/RMSE (unchanged from before) ──────────────────
     grp        = df2.groupby("bucket")["next_pct"]
     bucket_sum = grp.transform("sum")
     bucket_n   = grp.transform("count")
     loo_pred   = (bucket_sum - df2["next_pct"]) / (bucket_n - 1)
     err        = df2["next_pct"] - loo_pred
+    mae        = float(err.abs().mean())
+    rmse       = float(np.sqrt((err ** 2).mean()))
+
+    baseline_mae = float((df2["next_pct"] - df2["next_pct"].mean()).abs().mean())
+    mae_score    = 0.0 if baseline_mae <= 0 else max(0.0, min(1.0, 1 - mae / baseline_mae))
+
+    # ── Assignment score: LOO-predicted direction vs. actual direction ──
+    pred_sign         = np.sign(loo_pred)
+    actual_sign        = np.sign(df2["next_pct"])
+    assignment_score   = float((pred_sign == actual_sign).mean())
+
+    # ── Calibration score: chronological train/test split per bucket ───
+    tail = (1 - CALIBRATION_TARGET_CI) / 2 * 100
+    hits, total = 0, 0
+    for _, group in df2.groupby("bucket", sort=False):
+        vals  = group["next_pct"].values
+        n     = len(vals)
+        split = int(n * CALIBRATION_TRAIN_FRACTION)
+        if split < 2 or split >= n:
+            continue
+        train, test = vals[:split], vals[split:]
+        lo_p = np.percentile(train, tail)
+        hi_p = np.percentile(train, 100 - tail)
+        hits  += int(np.sum((test >= lo_p) & (test <= hi_p)))
+        total += len(test)
+
+    if total == 0:
+        calibration_score, observed_calibration = 0.0, None
+    else:
+        observed_calibration = hits / total
+        calibration_score = max(0.0, 1 - abs(observed_calibration - CALIBRATION_TARGET_CI) / CALIBRATION_TARGET_CI)
+
+    overall_score = (
+        SCORE_WEIGHTS["calibration"] * calibration_score +
+        SCORE_WEIGHTS["assignment"]  * assignment_score +
+        SCORE_WEIGHTS["mae"]         * mae_score
+    ) * 100
 
     return {
-        "mae":  float(err.abs().mean()),
-        "rmse": float(np.sqrt((err ** 2).mean())),
+        "mae":  mae,
+        "rmse": rmse,
         "n":    int(len(df2)),
+        "calibration_pct":   None if observed_calibration is None else round(observed_calibration * 100, 2),
+        "assignment_pct":    round(assignment_score * 100, 2),
+        "calibration_score": round(calibration_score, 4),
+        "assignment_score":  round(assignment_score, 4),
+        "mae_score":         round(mae_score, 4),
+        "overall_score":     round(overall_score, 2),
     }
 
 
@@ -303,20 +443,27 @@ def optimize_type_thresholds(transitions: list, type_idx: int, verbose: bool = T
     best = None
     for lo in BEAR_GRID:
         for hi in BULL_GRID:
-            metrics = backtest_type_thresholds(occ_df, lo, hi)
+            metrics = evaluate_threshold_candidate(occ_df, lo, hi)
             if metrics is None:
                 continue
-            if best is None or metrics["rmse"] < best["rmse"]:
+            if best is None or metrics["overall_score"] > best["overall_score"]:
                 best = {"boundaries": [round(float(lo), 3), round(float(hi), 3)], **metrics}
 
     label = TRANSITION_TYPE_LABELS[type_idx]
     if best is None:
-        best = {"boundaries": list(DEFAULT_BOUNDARIES), "mae": None, "rmse": None, "n": len(occ_df)}
+        best = {
+            "boundaries": list(DEFAULT_BOUNDARIES), "mae": None, "rmse": None, "n": len(occ_df),
+            "calibration_pct": None, "assignment_pct": None,
+            "calibration_score": None, "assignment_score": None, "mae_score": None,
+            "overall_score": None,
+        }
         if verbose:
             print(f"    {label:<10}  insufficient data (n={len(occ_df)}) — using default {DEFAULT_BOUNDARIES}")
     elif verbose:
         print(f"    {label:<10}  boundaries={best['boundaries']}  "
-              f"RMSE={best['rmse']:.3f}%  MAE={best['mae']:.3f}%  (n={best['n']})")
+              f"Score={best['overall_score']:.1f}  "
+              f"(calib={best['calibration_pct']}%  assign={best['assignment_pct']}%  "
+              f"MAE={best['mae']:.3f}%)  (n={best['n']})")
     return best
 
 
@@ -344,10 +491,13 @@ def get_thresholds_by_type(ticker: str, transitions: list, stored: dict) -> dict
         if SAVE_OPTIMIZED_THRESHOLDS:
             stored[ticker] = {
                 TRANSITION_TYPE_LABELS[i]: {
-                    "boundaries": type_results[i]["boundaries"],
-                    "mae":  type_results[i]["mae"],
-                    "rmse": type_results[i]["rmse"],
-                    "n":    type_results[i]["n"],
+                    "boundaries":         type_results[i]["boundaries"],
+                    "mae":                type_results[i]["mae"],
+                    "rmse":               type_results[i]["rmse"],
+                    "n":                  type_results[i]["n"],
+                    "overall_score":      type_results[i].get("overall_score"),
+                    "calibration_pct":    type_results[i].get("calibration_pct"),
+                    "assignment_pct":     type_results[i].get("assignment_pct"),
                 } for i in range(N_TYPES)
             }
             save_thresholds(stored)
@@ -493,6 +643,224 @@ def summarize_forecast(paths: np.ndarray, horizon: int) -> pd.DataFrame:
         row["mean"] = np.mean(prices)
         rows.append(row)
     return pd.DataFrame(rows).set_index("Day")
+
+
+# ─────────────────────────────────────────────
+# FULL EVALUATOR-DRIVEN THRESHOLD OPTIMIZER
+# ─────────────────────────────────────────────
+# This is the redesigned pipeline:
+#
+#     Historical Data -> Threshold Optimizer -> [calls] Evaluator
+#                                                    |
+#                                          runs the REAL Monte Carlo
+#                                          engine, walked forward
+#                                          through history
+#                                                    |
+#                                             Overall Score
+#                                                    |
+#                              Threshold Optimizer keeps the winner
+#
+# Unlike evaluate_threshold_candidate() (the fast proxy above, which never
+# touches run_state_conditional_mc), evaluate_thresholds_walkforward() is
+# the literal evaluator: for a given FIXED thresholds_by_type, it walks
+# forward through df, and at each sampled day rebuilds the state map from
+# ONLY the data available as of that day (no lookahead) and calls the real
+# run_state_conditional_mc engine, then scores calibration + directional
+# assignment + 1-day MAE against the actual future closes. Same three-part
+# scoring formula and SCORE_WEIGHTS as the fast evaluator, so scores from
+# both are on the same 0-100 scale and comparable.
+#
+# One consequence of using the real 9-state engine: all 5 transition types'
+# thresholds affect the state machine jointly, so a true joint grid search
+# would be a 10-dimensional optimization — computationally impossible.
+# optimize_thresholds_full() instead does coordinate ascent: hold 4 types
+# fixed, grid-search the 5th against the evaluator, move to the next type,
+# repeat for FULL_EVALUATOR_CONFIG["coord_ascent_passes"] passes.
+def evaluate_thresholds_walkforward(
+    df: pd.DataFrame,
+    thresholds_by_type: dict,
+    config: dict = None,
+) -> dict | None:
+    config      = config or FULL_EVALUATOR_CONFIG
+    n_sims      = config["n_sims"]
+    stride      = config["stride"]
+    min_hist    = config["min_history_days"]
+    horizons    = config["horizons"]
+    target_ci   = CALIBRATION_TARGET_CI
+
+    df = df.sort_index()
+    n  = len(df)
+    max_h = max(horizons)
+    last_valid = n - max_h - 1
+    if last_valid <= min_hist:
+        return None
+
+    calib_hits, calib_total   = 0, 0
+    assign_hits, assign_total = 0, 0
+    abs_errs, baseline_abs_errs = [], []
+
+    for i in range(min_hist, last_valid + 1, stride):
+        df_hist = df.iloc[: i + 1]
+        transitions = build_transition_sequence(df_hist)
+        if len(transitions) < 50:
+            continue
+
+        state_map, unconditional_by_type, regimes, current_state, current_next_type_idx = \
+            build_state_index(transitions, thresholds_by_type)
+
+        start_price = float(df_hist["Close"].iloc[-1])
+
+        paths = run_state_conditional_mc(
+            start_price, current_state, current_next_type_idx,
+            state_map, unconditional_by_type, thresholds_by_type,
+            max_h, n_sims=n_sims, seed=2_000_000 + i,
+        )
+
+        # calibration, at CALIBRATION_TARGET_CI, across the configured horizons
+        for h in horizons:
+            future_idx = i + h
+            if future_idx >= n:
+                continue
+            actual = float(df["Close"].iloc[future_idx])
+            sim    = paths[:, h]
+            tail   = (1 - target_ci) / 2 * 100
+            lo_p, hi_p = np.percentile(sim, tail), np.percentile(sim, 100 - tail)
+            calib_total += 1
+            if lo_p <= actual <= hi_p:
+                calib_hits += 1
+
+        # directional assignment + MAE, at the +1 day horizon
+        future_idx1 = i + 1
+        if future_idx1 < n:
+            actual1 = float(df["Close"].iloc[future_idx1])
+            pred1   = float(np.mean(paths[:, 1]))
+            assign_total += 1
+            if np.sign(pred1 - start_price) == np.sign(actual1 - start_price):
+                assign_hits += 1
+            abs_errs.append(abs(actual1 - pred1))
+            baseline_abs_errs.append(abs(actual1 - start_price))   # naive random-walk baseline
+
+    if calib_total == 0 or assign_total == 0 or not abs_errs:
+        return None
+
+    observed_calibration = calib_hits / calib_total
+    calibration_score    = max(0.0, 1 - abs(observed_calibration - target_ci) / target_ci)
+
+    assignment_score = assign_hits / assign_total
+
+    mae          = float(np.mean(abs_errs))
+    baseline_mae = float(np.mean(baseline_abs_errs))
+    mae_score    = 0.0 if baseline_mae <= 0 else max(0.0, min(1.0, 1 - mae / baseline_mae))
+
+    overall_score = (
+        SCORE_WEIGHTS["calibration"] * calibration_score +
+        SCORE_WEIGHTS["assignment"]  * assignment_score +
+        SCORE_WEIGHTS["mae"]         * mae_score
+    ) * 100
+
+    return {
+        "mae": mae,
+        "n":   calib_total,
+        "calibration_pct":   round(observed_calibration * 100, 2),
+        "assignment_pct":    round(assignment_score * 100, 2),
+        "calibration_score": round(calibration_score, 4),
+        "assignment_score":  round(assignment_score, 4),
+        "mae_score":         round(mae_score, 4),
+        "overall_score":     round(overall_score, 2),
+    }
+
+
+def optimize_thresholds_full(df: pd.DataFrame, config: dict = None, verbose: bool = True) -> tuple:
+    """
+    THE (full) Threshold Optimizer. Coordinate-ascent grid search, each
+    candidate scored by evaluate_thresholds_walkforward() (which runs the
+    real Monte Carlo engine). Returns (thresholds_by_type, score_log).
+
+    WARNING: this calls the real Monte Carlo engine on real historical
+    walk-forward points hundreds of times over. Expect minutes, not
+    seconds — tune FULL_EVALUATOR_CONFIG to trade precision for speed.
+    """
+    config = config or FULL_EVALUATOR_CONFIG
+    thresholds_by_type = {i: list(DEFAULT_BOUNDARIES) for i in range(N_TYPES)}
+    score_log           = {i: None for i in range(N_TYPES)}
+
+    t_start = time.time()
+    n_candidates_per_type = len(config["bear_grid"]) * len(config["bull_grid"])
+    total_calls = n_candidates_per_type * N_TYPES * config["coord_ascent_passes"]
+    if verbose:
+        print(f"    (grid: {len(config['bear_grid'])}x{len(config['bull_grid'])} per type, "
+              f"{config['coord_ascent_passes']} pass(es) -> {total_calls} Monte Carlo walk-forward evaluations total)")
+
+    for p in range(config["coord_ascent_passes"]):
+        if verbose:
+            print(f"\n  -- coordinate-ascent pass {p + 1}/{config['coord_ascent_passes']} --")
+        for type_idx in range(N_TYPES):
+            label = TRANSITION_TYPE_LABELS[type_idx]
+            best = None
+            for lo in config["bear_grid"]:
+                for hi in config["bull_grid"]:
+                    candidate = dict(thresholds_by_type)
+                    candidate[type_idx] = [round(float(lo), 3), round(float(hi), 3)]
+                    metrics = evaluate_thresholds_walkforward(df, candidate, config)
+                    if metrics is None:
+                        continue
+                    if best is None or metrics["overall_score"] > best["overall_score"]:
+                        best = {"boundaries": candidate[type_idx], **metrics}
+
+            if best is not None:
+                thresholds_by_type[type_idx] = best["boundaries"]
+                score_log[type_idx] = best
+                if verbose:
+                    elapsed = time.time() - t_start
+                    print(f"    {label:<10}  boundaries={best['boundaries']}  "
+                          f"Score={best['overall_score']:.1f}  "
+                          f"(calib={best['calibration_pct']}%  assign={best['assignment_pct']}%  "
+                          f"MAE={best['mae']:.3f})  [{elapsed:,.0f}s elapsed]")
+            elif verbose:
+                print(f"    {label:<10}  insufficient walk-forward data — keeping default {thresholds_by_type[type_idx]}")
+
+    if verbose:
+        print(f"\n  Full evaluator-driven optimization complete in {time.time() - t_start:,.0f}s")
+
+    return thresholds_by_type, score_log
+
+
+def get_thresholds_full(ticker: str, df: pd.DataFrame, stored: dict) -> dict:
+    print(f"\n  [FULL evaluator] Optimizing thresholds for {ticker} — baking the Monte Carlo "
+          f"walk-forward evaluator directly into the threshold search...")
+    thresholds_by_type, score_log = optimize_thresholds_full(df)
+    if SAVE_OPTIMIZED_THRESHOLDS:
+        stored[ticker] = {
+            TRANSITION_TYPE_LABELS[i]: {
+                "boundaries": thresholds_by_type[i],
+                **({k: v for k, v in score_log[i].items() if k != "boundaries"} if score_log[i] else {}),
+                "optimizer_mode": "full",
+            } for i in range(N_TYPES)
+        }
+        save_thresholds(stored)
+    return thresholds_by_type
+
+
+def resolve_thresholds(ticker: str, df: pd.DataFrame, transitions: list, stored: dict) -> dict:
+    """
+    Single entry point main() calls to get {type_idx: [lo, hi]}. Dispatches
+    to the full evaluator-in-the-loop optimizer, the fast proxy optimizer,
+    or the cache/default, based on OPTIMIZE_THRESHOLDS / OPTIMIZER_MODE.
+    """
+    if not OPTIMIZE_THRESHOLDS:
+        cached = stored.get(ticker, {})
+        out = {}
+        for i in range(N_TYPES):
+            entry = cached.get(TRANSITION_TYPE_LABELS[i])
+            out[i] = entry["boundaries"] if entry else list(DEFAULT_BOUNDARIES)
+        print(f"\n  Using cached/default thresholds for {ticker}: "
+              f"{{ {', '.join(f'{TRANSITION_TYPE_LABELS[i]}: {out[i]}' for i in range(N_TYPES))} }}")
+        return out
+
+    if OPTIMIZER_MODE == "full":
+        return get_thresholds_full(ticker, df, stored)
+    else:
+        return get_thresholds_by_type(ticker, transitions, stored)
 
 
 # ─────────────────────────────────────────────
@@ -839,10 +1207,200 @@ def print_forecast_summary(ticker: str, start_price: float, horizon: int,
 
 
 # ─────────────────────────────────────────────
+# MONTE CARLO CALIBRATION BACKTEST
+# ─────────────────────────────────────────────
+# Purpose: measure whether the state-conditional MC engine's predicted
+# confidence intervals are statistically well calibrated, by replaying
+# history day by day. This section only READS df / calls the existing
+# forecasting functions with a truncated ("as of that day") dataframe —
+# it does not alter run_state_conditional_mc, build_state_index, or any
+# other forecasting logic.
+def evaluate_calibration_for_ticker(
+    ticker: str,
+    df: pd.DataFrame,
+    horizons: list = FORECAST_HORIZONS,
+    confidence_levels: list = None,
+    n_sims: int = None,
+    stride: int = None,
+    min_history_days: int = None,
+) -> dict:
+    """
+    Walks df day by day (every `stride`-th day, starting once
+    `min_history_days` of history exist and at least max(horizons)
+    trading days remain after it). For each such day:
+      - truncates df to ONLY data up to and including that day
+      - rebuilds transitions + optimizes thresholds from that truncated
+        history only (no lookahead)
+      - runs the normal state-conditional MC out to the longest horizon
+      - for every horizon and every confidence level, checks whether the
+        REAL future close (read from the full df, used only for scoring,
+        never for building the model) fell inside the simulated interval
+
+    Returns: {horizon: {conf_level: {"hits": int, "total": int}}}
+    """
+    confidence_levels = confidence_levels or BACKTEST_CONFIG["confidence_levels"]
+    n_sims            = n_sims           or BACKTEST_CONFIG["n_sims"]
+    stride            = stride           or BACKTEST_CONFIG["stride"]
+    min_history_days  = min_history_days or BACKTEST_CONFIG["min_history_days"]
+
+    df = df.sort_index()
+    n  = len(df)
+    max_horizon = max(horizons)
+
+    results = {h: {c: {"hits": 0, "total": 0} for c in confidence_levels} for h in horizons}
+
+    last_valid_idx = n - max_horizon - 1
+    if last_valid_idx <= min_history_days:
+        print(f"  [{ticker}] Not enough history for calibration backtest — skipping.")
+        return results
+
+    eval_indices = range(min_history_days, last_valid_idx + 1, stride)
+
+    for i in eval_indices:
+        df_hist = df.iloc[: i + 1]   # everything known "as of" this simulated day
+
+        transitions = build_transition_sequence(df_hist)
+        if len(transitions) < 50:
+            continue
+
+        # Thresholds re-optimized from history-to-date only (bypasses the
+        # live threshold cache file entirely — this is a scratch model).
+        type_results       = optimize_all_thresholds(transitions, verbose=False)
+        thresholds_by_type = {k: v["boundaries"] for k, v in type_results.items()}
+
+        state_map, unconditional_by_type, regimes, current_state, current_next_type_idx = \
+            build_state_index(transitions, thresholds_by_type)
+
+        start_price = float(df_hist["Close"].iloc[-1])
+
+        paths = run_state_conditional_mc(
+            start_price, current_state, current_next_type_idx,
+            state_map, unconditional_by_type, thresholds_by_type,
+            max_horizon, n_sims=n_sims, seed=1_000_000 + i,
+        )
+
+        for h in horizons:
+            future_idx = i + h
+            if future_idx >= n:
+                continue
+            actual_price = float(df["Close"].iloc[future_idx])
+            sim_prices   = paths[:, h]
+
+            for c in confidence_levels:
+                tail    = (1 - c) / 2 * 100
+                lower   = np.percentile(sim_prices, tail)
+                upper   = np.percentile(sim_prices, 100 - tail)
+                results[h][c]["total"] += 1
+                if lower <= actual_price <= upper:
+                    results[h][c]["hits"] += 1
+
+    return results
+
+
+def assess_calibration(observed_pct: float, target_pct: float, tolerance: float = None) -> tuple:
+    """Returns (verdict_line, explanation_line) for the Overall Assessment block."""
+    tolerance = tolerance if tolerance is not None else BACKTEST_CONFIG["tolerance_pts"]
+    diff = observed_pct - target_pct
+    if abs(diff) <= tolerance:
+        return ("✓ Excellent calibration",
+                "The model's predicted confidence intervals closely match historical outcomes.")
+    elif diff < 0:
+        return ("⚠ Confidence intervals appear too narrow.",
+                "The model is underestimating uncertainty and producing overly confident forecasts.")
+    else:
+        return ("⚠ Confidence intervals appear too wide.",
+                "The model is overestimating uncertainty and producing overly conservative forecasts.")
+
+
+def print_calibration_reports(all_results: dict, horizons: list = None, confidence_levels: list = None):
+    """
+    all_results: {ticker: {horizon: {conf_level: {"hits", "total"}}}}
+    Prints one table per horizon (rows = tickers, cols = confidence levels),
+    followed by an Overall Assessment for that horizon.
+    """
+    horizons          = horizons or FORECAST_HORIZONS
+    confidence_levels = confidence_levels or BACKTEST_CONFIG["confidence_levels"]
+    assessment_ci      = BACKTEST_CONFIG["assessment_ci"]
+
+    tickers = [t for t in all_results if any(
+        all_results[t][h][c]["total"] > 0 for h in horizons for c in confidence_levels
+    )]
+
+    print(f"\n{'='*66}")
+    print("MONTE CARLO CALIBRATION REPORT")
+    print(f"{'='*66}")
+
+    if not tickers:
+        print("\n  No tickers had enough history to run the calibration backtest.")
+        return
+
+    for h in horizons:
+        day_label = f"+{h} Trading Day" + ("s" if h != 1 else "")
+        print(f"\nForecast Horizon: {day_label}")
+        print(f"\n{'-'*61}")
+        header = f"{'Ticker':<12}" + "".join(f"{str(int(c*100)) + '%':>9}" for c in confidence_levels)
+        print(header)
+        print(f"{'-'*61}")
+
+        ci_calibrations = {c: [] for c in confidence_levels}
+
+        for t in tickers:
+            row = f"{t:<12}"
+            for c in confidence_levels:
+                bucket = all_results[t][h][c]
+                if bucket["total"] > 0:
+                    pct = bucket["hits"] / bucket["total"] * 100
+                    ci_calibrations[c].append(pct)
+                    row += f"{pct:>8.1f}%"
+                else:
+                    row += f"{'--':>9}"
+            print(row)
+
+        print(f"{'-'*61}")
+
+        # Overall Assessment for this horizon, driven by the configured CI
+        assess_vals = ci_calibrations.get(assessment_ci, [])
+        print("\nOverall Assessment")
+        print(f"\nAverage {int(assessment_ci*100)}% Calibration\n")
+        if assess_vals:
+            avg = sum(assess_vals) / len(assess_vals)
+            print(f"{avg:.1f}%\n")
+            verdict, explanation = assess_calibration(avg, assessment_ci * 100)
+            print(verdict)
+            print(f"\n{explanation}")
+        else:
+            print("  (no data)")
+
+
+def run_calibration_backtest(tickers: list, dataframes: dict):
+    """
+    dataframes: {ticker: df} — the already-fetched full-history dataframes
+    from the normal run, reused here so we don't re-download anything.
+    """
+    print(f"\n{'#'*66}")
+    print("  Running Monte Carlo calibration backtest ...")
+    print(f"  (n_sims={BACKTEST_CONFIG['n_sims']:,} per eval day, "
+          f"stride={BACKTEST_CONFIG['stride']}, "
+          f"min_history_days={BACKTEST_CONFIG['min_history_days']})")
+    print(f"{'#'*66}")
+
+    all_results = {}
+    for ticker in tickers:
+        df = dataframes.get(ticker)
+        if df is None or df.empty:
+            continue
+        print(f"\n  Backtesting {ticker} ...")
+        all_results[ticker] = evaluate_calibration_for_ticker(ticker, df)
+
+    print_calibration_reports(all_results)
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
     custom_start_prices = {"NVDA": None, "WULF": None, "SOFI": None}
+    fetched_dataframes  = {}   # reused by the calibration backtest below, avoids re-downloading
 
     for ticker in TICKERS:
         print(f"\n{'#'*66}")
@@ -853,6 +1411,7 @@ def main():
         if df.empty:
             print(f"  ERROR: No data for {ticker}, skipping.")
             continue
+        fetched_dataframes[ticker] = df
 
         # ── Unconditional weekly chain (prior Fri close -> next Fri close) ──
         if custom_start_prices.get(ticker) is not None:
@@ -891,7 +1450,7 @@ def main():
         if REPORT["state_forecast"]:
             transitions = build_transition_sequence(df)
             stored = load_thresholds()
-            thresholds_by_type = get_thresholds_by_type(ticker, transitions, stored)
+            thresholds_by_type = resolve_thresholds(ticker, df, transitions, stored)
 
             state_map, unconditional_by_type, regimes, current_state, current_next_type_idx = \
                 build_state_index(transitions, thresholds_by_type)
@@ -923,6 +1482,9 @@ def main():
                 print_forecast_summary(ticker, state_start_price, horizon, summary_df, paths, last_date)
 
             print(f"\n\n\n\n{'#'*66}")
+
+    if REPORT["calibration_backtest"]:
+        run_calibration_backtest(TICKERS, fetched_dataframes)
 
     print(f"\nDone!\n")
 
