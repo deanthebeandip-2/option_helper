@@ -71,6 +71,9 @@ REPORT = {
     # Future modules
     "backtesting": False,
     "live_analysis": False,
+
+    # Calibration backtest (runs after the normal per-ticker report)
+    "calibration_backtest": True,
 }
 
 # The 5-transition weekly cycle. Order matters — it defines both the
@@ -104,8 +107,24 @@ BEAR_GRID = np.arange(-5.0, -0.24, 0.25)   # -5.00 ... -0.25
 BULL_GRID = np.arange(0.25, 5.01, 0.25)    # +0.25 ... +5.00
 
 # ── Options grid display settings ────────────────────────────────────────
-MIN_DISPLAY_PROB = 0.1   # rows with prob <= this (in %) are cut off
+MIN_DISPLAY_PROB = 1.99   # rows with prob <= this (in %) are cut off
 MAX_STRIKE_PCT   = 60      # safety cap so a degenerate distribution can't loop forever
+
+# ── Calibration backtest settings ────────────────────────────────────────
+# Walks back through history, pretends each sampled day is "today", rebuilds
+# the model from ONLY the data available as of that day, runs the normal
+# +1..+5 state-conditional forecast, and checks whether the actual future
+# close fell inside the predicted confidence interval. This never touches
+# the live forecasting logic above — it just calls the same functions with
+# a truncated dataframe.
+BACKTEST_CONFIG = {
+    "n_sims":           2_000,   # smaller than live N_SIMULATIONS — this runs hundreds of times
+    "stride":           5,       # evaluate every Nth trading day (1 = every day, slow)
+    "min_history_days": 500,     # need enough history before the first eval day
+    "confidence_levels": [0.50, 0.75, 0.90, 0.95],
+    "assessment_ci":    0.90,    # which CI drives the pass/fail "Overall Assessment" line
+    "tolerance_pts":    3.0,     # +/- percentage points considered "well calibrated"
+}
 
 # Palette
 C_BEAR   = "#d73027"
@@ -839,10 +858,200 @@ def print_forecast_summary(ticker: str, start_price: float, horizon: int,
 
 
 # ─────────────────────────────────────────────
+# MONTE CARLO CALIBRATION BACKTEST
+# ─────────────────────────────────────────────
+# Purpose: measure whether the state-conditional MC engine's predicted
+# confidence intervals are statistically well calibrated, by replaying
+# history day by day. This section only READS df / calls the existing
+# forecasting functions with a truncated ("as of that day") dataframe —
+# it does not alter run_state_conditional_mc, build_state_index, or any
+# other forecasting logic.
+def evaluate_calibration_for_ticker(
+    ticker: str,
+    df: pd.DataFrame,
+    horizons: list = FORECAST_HORIZONS,
+    confidence_levels: list = None,
+    n_sims: int = None,
+    stride: int = None,
+    min_history_days: int = None,
+) -> dict:
+    """
+    Walks df day by day (every `stride`-th day, starting once
+    `min_history_days` of history exist and at least max(horizons)
+    trading days remain after it). For each such day:
+      - truncates df to ONLY data up to and including that day
+      - rebuilds transitions + optimizes thresholds from that truncated
+        history only (no lookahead)
+      - runs the normal state-conditional MC out to the longest horizon
+      - for every horizon and every confidence level, checks whether the
+        REAL future close (read from the full df, used only for scoring,
+        never for building the model) fell inside the simulated interval
+
+    Returns: {horizon: {conf_level: {"hits": int, "total": int}}}
+    """
+    confidence_levels = confidence_levels or BACKTEST_CONFIG["confidence_levels"]
+    n_sims            = n_sims           or BACKTEST_CONFIG["n_sims"]
+    stride            = stride           or BACKTEST_CONFIG["stride"]
+    min_history_days  = min_history_days or BACKTEST_CONFIG["min_history_days"]
+
+    df = df.sort_index()
+    n  = len(df)
+    max_horizon = max(horizons)
+
+    results = {h: {c: {"hits": 0, "total": 0} for c in confidence_levels} for h in horizons}
+
+    last_valid_idx = n - max_horizon - 1
+    if last_valid_idx <= min_history_days:
+        print(f"  [{ticker}] Not enough history for calibration backtest — skipping.")
+        return results
+
+    eval_indices = range(min_history_days, last_valid_idx + 1, stride)
+
+    for i in eval_indices:
+        df_hist = df.iloc[: i + 1]   # everything known "as of" this simulated day
+
+        transitions = build_transition_sequence(df_hist)
+        if len(transitions) < 50:
+            continue
+
+        # Thresholds re-optimized from history-to-date only (bypasses the
+        # live threshold cache file entirely — this is a scratch model).
+        type_results       = optimize_all_thresholds(transitions, verbose=False)
+        thresholds_by_type = {k: v["boundaries"] for k, v in type_results.items()}
+
+        state_map, unconditional_by_type, regimes, current_state, current_next_type_idx = \
+            build_state_index(transitions, thresholds_by_type)
+
+        start_price = float(df_hist["Close"].iloc[-1])
+
+        paths = run_state_conditional_mc(
+            start_price, current_state, current_next_type_idx,
+            state_map, unconditional_by_type, thresholds_by_type,
+            max_horizon, n_sims=n_sims, seed=1_000_000 + i,
+        )
+
+        for h in horizons:
+            future_idx = i + h
+            if future_idx >= n:
+                continue
+            actual_price = float(df["Close"].iloc[future_idx])
+            sim_prices   = paths[:, h]
+
+            for c in confidence_levels:
+                tail    = (1 - c) / 2 * 100
+                lower   = np.percentile(sim_prices, tail)
+                upper   = np.percentile(sim_prices, 100 - tail)
+                results[h][c]["total"] += 1
+                if lower <= actual_price <= upper:
+                    results[h][c]["hits"] += 1
+
+    return results
+
+
+def assess_calibration(observed_pct: float, target_pct: float, tolerance: float = None) -> tuple:
+    """Returns (verdict_line, explanation_line) for the Overall Assessment block."""
+    tolerance = tolerance if tolerance is not None else BACKTEST_CONFIG["tolerance_pts"]
+    diff = observed_pct - target_pct
+    if abs(diff) <= tolerance:
+        return ("✓ Excellent calibration",
+                "The model's predicted confidence intervals closely match historical outcomes.")
+    elif diff < 0:
+        return ("⚠ Confidence intervals appear too narrow.",
+                "The model is underestimating uncertainty and producing overly confident forecasts.")
+    else:
+        return ("⚠ Confidence intervals appear too wide.",
+                "The model is overestimating uncertainty and producing overly conservative forecasts.")
+
+
+def print_calibration_reports(all_results: dict, horizons: list = None, confidence_levels: list = None):
+    """
+    all_results: {ticker: {horizon: {conf_level: {"hits", "total"}}}}
+    Prints one table per horizon (rows = tickers, cols = confidence levels),
+    followed by an Overall Assessment for that horizon.
+    """
+    horizons          = horizons or FORECAST_HORIZONS
+    confidence_levels = confidence_levels or BACKTEST_CONFIG["confidence_levels"]
+    assessment_ci      = BACKTEST_CONFIG["assessment_ci"]
+
+    tickers = [t for t in all_results if any(
+        all_results[t][h][c]["total"] > 0 for h in horizons for c in confidence_levels
+    )]
+
+    print(f"\n{'='*66}")
+    print("MONTE CARLO CALIBRATION REPORT")
+    print(f"{'='*66}")
+
+    if not tickers:
+        print("\n  No tickers had enough history to run the calibration backtest.")
+        return
+
+    for h in horizons:
+        day_label = f"+{h} Trading Day" + ("s" if h != 1 else "")
+        print(f"\nForecast Horizon: {day_label}")
+        print(f"\n{'-'*61}")
+        header = f"{'Ticker':<12}" + "".join(f"{str(int(c*100)) + '%':>9}" for c in confidence_levels)
+        print(header)
+        print(f"{'-'*61}")
+
+        ci_calibrations = {c: [] for c in confidence_levels}
+
+        for t in tickers:
+            row = f"{t:<12}"
+            for c in confidence_levels:
+                bucket = all_results[t][h][c]
+                if bucket["total"] > 0:
+                    pct = bucket["hits"] / bucket["total"] * 100
+                    ci_calibrations[c].append(pct)
+                    row += f"{pct:>8.1f}%"
+                else:
+                    row += f"{'--':>9}"
+            print(row)
+
+        print(f"{'-'*61}")
+
+        # Overall Assessment for this horizon, driven by the configured CI
+        assess_vals = ci_calibrations.get(assessment_ci, [])
+        print("\nOverall Assessment")
+        print(f"\nAverage {int(assessment_ci*100)}% Calibration\n")
+        if assess_vals:
+            avg = sum(assess_vals) / len(assess_vals)
+            print(f"{avg:.1f}%\n")
+            verdict, explanation = assess_calibration(avg, assessment_ci * 100)
+            print(verdict)
+            print(f"\n{explanation}")
+        else:
+            print("  (no data)")
+
+
+def run_calibration_backtest(tickers: list, dataframes: dict):
+    """
+    dataframes: {ticker: df} — the already-fetched full-history dataframes
+    from the normal run, reused here so we don't re-download anything.
+    """
+    print(f"\n{'#'*66}")
+    print("  Running Monte Carlo calibration backtest ...")
+    print(f"  (n_sims={BACKTEST_CONFIG['n_sims']:,} per eval day, "
+          f"stride={BACKTEST_CONFIG['stride']}, "
+          f"min_history_days={BACKTEST_CONFIG['min_history_days']})")
+    print(f"{'#'*66}")
+
+    all_results = {}
+    for ticker in tickers:
+        df = dataframes.get(ticker)
+        if df is None or df.empty:
+            continue
+        print(f"\n  Backtesting {ticker} ...")
+        all_results[ticker] = evaluate_calibration_for_ticker(ticker, df)
+
+    print_calibration_reports(all_results)
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
     custom_start_prices = {"NVDA": None, "WULF": None, "SOFI": None}
+    fetched_dataframes  = {}   # reused by the calibration backtest below, avoids re-downloading
 
     for ticker in TICKERS:
         print(f"\n{'#'*66}")
@@ -853,6 +1062,7 @@ def main():
         if df.empty:
             print(f"  ERROR: No data for {ticker}, skipping.")
             continue
+        fetched_dataframes[ticker] = df
 
         # ── Unconditional weekly chain (prior Fri close -> next Fri close) ──
         if custom_start_prices.get(ticker) is not None:
@@ -923,6 +1133,9 @@ def main():
                 print_forecast_summary(ticker, state_start_price, horizon, summary_df, paths, last_date)
 
             print(f"\n\n\n\n{'#'*66}")
+
+    if REPORT["calibration_backtest"]:
+        run_calibration_backtest(TICKERS, fetched_dataframes)
 
     print(f"\nDone!\n")
 

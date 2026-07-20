@@ -65,71 +65,7 @@ Working on this concurrently with 3, since having day to day dynamic thresholds 
 
 7) GPT's idea: 
 
-==========================================
-MODEL SCORECARD
-==========================================
-
-1-Day Forecast
-MAE
-0.92%
-
-RMSE
-1.18%
-
-Calibration
-50%
-49.8%
-
-75%
-74.9%
-
-90%
-90.7%
-
-95%
-95.1%
-
-==========================================
-
-5-Day Forecast
-MAE
-2.44%
-
-RMSE
-3.12%
-
-Calibration
-50%
-50.5%
-
-75%
-74.2%
-
-90%
-89.6%
-
-95%
-94.8%
-
-==========================================
-Covered Calls
-Assignment Probability Error
-Average
-
-1.6%
-
-Maximum
-
-4.3%
-
-==========================================
-
-Overall Model Score
-
-★★★★☆
-
-9.2 / 10
-
+create a model scorecard! E.g. for each +1, +2 days, etc. I need to add a % of actual prices that fall within the range. E.g. for 75%, is it close to actually 75? or is it way off like 80%, etc.
 
 
 
@@ -140,9 +76,12 @@ Next steps:
 [COMPLETED]
 Phase 1: Second-order state model (9 states based on the previous two transitions). This replaces the Monday-centric logic and becomes the new foundation.
 
+
+[COMPLETED]
 QOL:
 1) Add 1, 2, 3, 4, 5 instead of up to 10. days, because the further down you go the more noise, better to just keep the analysis max of 5 days.
 2) Instead of +1 days, +2 days, show the date. For example if today is 7/14/2026. I want to see +1 as 7/15/2026, etc. Just to make it easier to read.
+
 
 Build a model evaluator
 
@@ -188,11 +127,6 @@ Market volatility
 Earnings season
 
 This creates a regime-switching model in which market behavior changes depending on the overall environment rather than assuming a stationary process.
-
-
-
-
-
 
 
 
@@ -258,3 +192,9 @@ Regime Switching
 Hidden Markov Models
 
 Neural Networks (if ever)
+
+
+
+
+7/20/2026: New goal:
+Bake the evaulator directly into the dynamic threshold finder. I don't want to create the thresholds just for them to be ass, I need to pick the best thresholds based on how well the model evaulator turns out. For example for Nvidia's bull threshold +3% is ass, +3.2% is great, but +3.4% is ass, then that clearly shows me +3.2% is Nvidia's clear bull threshold, using backtesting to prove.
