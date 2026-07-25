@@ -1,0 +1,395 @@
+The current architecture
+
+Right now you have two independent pieces.
+
+Historical Data
+        │
+        ▼
+Find Best Thresholds
+        │
+        ▼
+Run Monte Carlo
+        │
+        ▼
+Run Evaluator
+
+The problem is...
+
+The threshold finder and the evaluator are optimizing different things.
+
+The threshold finder might say
+
+Bear < -1.3%
+
+Bull > +3.5%
+
+because maybe that minimizes average prediction error.
+
+Then the evaluator comes along and says
+
+90% interval
+
+Observed
+
+82%
+
+Meaning
+
+The thresholds actually produced a poorly calibrated model.
+
+I would merge them.
+
+Instead think of it like this.
+
+Candidate Thresholds
+
+↓
+
+Run Full Historical Backtest
+
+↓
+
+Evaluate Model Quality
+
+↓
+
+Keep Score
+
+↓
+
+Try Next Thresholds
+
+↓
+
+Repeat
+
+↓
+
+Choose Winner
+
+Now you're no longer optimizing thresholds.
+
+You're optimizing forecast quality.
+
+That's a huge philosophical difference.
+
+I would completely redefine the objective.
+
+Instead of asking
+
+"What Bear/Bull threshold looks best?"
+
+Ask
+
+"What thresholds make the Monte Carlo produce the best forecasts?"
+
+Those are not necessarily the same thing.
+
+Imagine this example.
+
+Try
+
+Bear < -1%
+
+Bull > +1%
+
+Run 1,200 historical tests.
+
+Results
+
+90% calibration
+
+82%
+
+1-day MAE
+
+1.1%
+
+Assignment Error
+
+3.4%
+
+Score
+
+82
+
+Now try
+
+Bear < -2.5%
+
+Bull > +2%
+
+Results
+
+90% calibration
+
+91%
+
+1-day MAE
+
+0.92%
+
+Assignment Error
+
+2.1%
+
+Score
+
+96
+
+Immediately better.
+
+Now try
+
+Bear < -4%
+
+Bull > +3%
+
+Results
+
+90%
+
+95%
+
+MAE
+
+1.6%
+
+Oops.
+
+Now intervals are too wide.
+
+Reject.
+
+Eventually you'll have
+
+Thresholds
+
+↓
+
+Model Score
+
+rather than
+
+Thresholds
+
+↓
+
+Prediction Error
+
+Those are very different optimization targets.
+
+I'd actually build a "Threshold Optimizer."
+
+Pseudo-code
+
+best_score = -inf
+
+for bear_threshold in candidate_bear_values:
+
+    for bull_threshold in candidate_bull_values:
+
+        score = evaluate_model(
+            bear_threshold,
+            bull_threshold
+        )
+
+        if score > best_score:
+
+            best_score = score
+            best_thresholds = (...)
+
+Notice
+
+evaluate_model()
+
+is now the optimization objective.
+
+Exactly like machine learning.
+
+Even better...
+
+You're no longer optimizing a single metric.
+
+You can optimize a weighted score.
+
+For example
+
+Overall Score
+
+=
+
+40%
+
+Calibration
+
++
+
+35%
+
+Assignment Accuracy
+
++
+
+25%
+
+1-Day MAE
+
+or whatever weights you decide matter most.
+
+Now every threshold pair gets one score.
+
+This is exactly what Kaggle competitors do.
+
+Nobody says
+
+"I think this parameter looks good."
+
+They say
+
+Try parameter
+
+↓
+
+Cross-validation
+
+↓
+
+Score
+
+↓
+
+Keep best
+
+You're essentially building your own cross-validation framework.
+
+Even better than a grid search
+
+Once you have this evaluator, the threshold search becomes modular.
+
+Today
+
+Grid Search
+
+Tomorrow
+
+Bayesian Optimization
+
+Later
+
+Genetic Algorithm
+
+Later
+
+Optuna
+
+None of that changes the evaluator.
+
+The evaluator is always
+
+Given thresholds
+
+↓
+
+Return score
+
+That's a beautiful software architecture.
+
+I think I'd even rethink the project architecture.
+
+Instead of
+
+Threshold Finder
+
+↓
+
+Simulator
+
+↓
+
+Evaluator
+
+I'd make
+
+Historical Data
+        │
+        ▼
+Threshold Optimizer
+        │
+        ▼
+Monte Carlo Engine
+        │
+        ▼
+Evaluator
+        │
+        ▼
+Overall Score
+
+where
+
+Threshold Optimizer
+
+↓
+
+calls Evaluator
+
+not the other way around.
+
+One idea I absolutely love
+
+I think you've stumbled into what could become the "training loop" for your entire forecasting engine.
+
+Imagine this:
+
+Candidate Model
+
+↓
+
+Run 1,500 historical walk-forward tests
+
+↓
+
+Score:
+
++1 MAE
+
++5 MAE
+
+Calibration
+
+Assignment Error
+
+↓
+
+Overall Score
+
+↓
+
+Accept / Reject
+
+Now everything in your project can plug into this loop:
+
+Different Bear/Flat/Bull thresholds
+Different numbers of states (3 vs. 5 regimes)
+Second-order vs. first-order state models
+SPY trend as a feature
+Volume as a feature
+ATR conditioning
+Eventually even HMMs
+
+The optimization target never changes—only the candidate model does.
+
+One refinement I'd make to your current threshold optimization
+
+Instead of optimizing the thresholds to minimize prediction error alone, optimize them to produce the best calibrated forecasting engine.
+
+For example, define an objective function like:
+
+Overall Score =
+    0.50 × Calibration Score
+  + 0.30 × Assignment Probability Score
+  + 0.20 × 1-Day Forecast Accuracy
+
+(You can tune these weights later.)
+
+This has an important consequence: the thresholds won't simply separate Bear/Flat/Bull regimes—they'll be chosen because they make the entire Monte Carlo engine perform best in historical walk-forward testing. That's a much stronger objective, and it naturally scales as you add more sophisticated features in the future. I think that's the architecture you'll be happiest with six months from now.
