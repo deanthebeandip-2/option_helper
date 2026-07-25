@@ -203,3 +203,6 @@ Bake the evaulator directly into the dynamic threshold finder. I don't want to c
 7/21/2026:
 QOL:
 1) don't need spread, unconditional, just noise at this point. Maybe keep just for the failsafe logic, but don't need it on the report.
+
+7/25/2026:
+more familiar with git
