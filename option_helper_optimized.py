@@ -50,8 +50,8 @@ LOOKBACK_YEARS = 10
 N_SIMULATIONS  = 100_000
 #N_SIMULATIONS  = 10_000
 CONFIDENCE     = [0.05, 0.25, 0.50, 0.75, 0.95]
-FORECAST_HORIZONS = [1, 2, 3, 4, 5]     # rolling forecast horizons, in trading days
-
+FORECAST_HORIZONS = [1, 2, 3, 4]     # rolling forecast horizons, in trading days
+#testing my github knowledge
 
 # ─────────────────────────────────────────────
 # REPORT CONFIGURATION
@@ -1552,6 +1552,8 @@ def run_calibration_backtest(tickers: list, dataframes: dict):
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
+def test_main():
+    print(5)
 def main():
     custom_start_prices = {"NVDA": None, "WULF": None, "SOFI": None}
     fetched_dataframes  = {}   # reused by the calibration backtest below, avoids re-downloading
@@ -1644,4 +1646,5 @@ def main():
 
 
 if __name__ == "__main__":
+    #test_main()
     main()

@@ -1,0 +1,79 @@
+{
+  "NVDA": {
+    "Fri->Mon": {
+      "boundaries": [
+        -4.0,
+        3.5
+      ],
+      "mae": 1.1996624204618187,
+      "n": 255,
+      "calibration_pct": 84.71,
+      "assignment_pct": 50.59,
+      "calibration_score": 0.9412,
+      "assignment_score": 0.5059,
+      "mae_score": 0.0,
+      "overall_score": 62.24,
+      "optimizer_mode": "full"
+    },
+    "Mon->Tue": {
+      "boundaries": [
+        -4.0,
+        2.75
+      ],
+      "mae": 1.2193248118021252,
+      "n": 255,
+      "calibration_pct": 84.71,
+      "assignment_pct": 56.47,
+      "calibration_score": 0.9412,
+      "assignment_score": 0.5647,
+      "mae_score": 0.0,
+      "overall_score": 64.0,
+      "optimizer_mode": "full"
+    },
+    "Tue->Wed": {
+      "boundaries": [
+        -1.0,
+        1.25
+      ],
+      "mae": 1.2212915072565214,
+      "n": 255,
+      "calibration_pct": 85.88,
+      "assignment_pct": 56.47,
+      "calibration_score": 0.9542,
+      "assignment_score": 0.5647,
+      "mae_score": 0.0,
+      "overall_score": 64.65,
+      "optimizer_mode": "full"
+    },
+    "Wed->Thu": {
+      "boundaries": [
+        -1.75,
+        3.5
+      ],
+      "mae": 1.1895563147491386,
+      "n": 255,
+      "calibration_pct": 86.27,
+      "assignment_pct": 57.65,
+      "calibration_score": 0.9586,
+      "assignment_score": 0.5765,
+      "mae_score": 0.0,
+      "overall_score": 65.22,
+      "optimizer_mode": "full"
+    },
+    "Thu->Fri": {
+      "boundaries": [
+        -2.5,
+        0.5
+      ],
+      "mae": 1.201872506987189,
+      "n": 255,
+      "calibration_pct": 86.27,
+      "assignment_pct": 55.29,
+      "calibration_score": 0.9586,
+      "assignment_score": 0.5529,
+      "mae_score": 0.0,
+      "overall_score": 64.52,
+      "optimizer_mode": "full"
+    }
+  }
+}
