@@ -14,7 +14,7 @@ Structure:
     main() -> download_option_chain() -> build_dataframe() -> print_table()
 
 Install deps:
-    pip install yfinance pandas
+    pip install yfinance pandas openpyxl
 
 Usage:
     python option_chain_table.py
@@ -45,10 +45,20 @@ FINAL_EXPIRATION_DATE = "8/14/2027"
 # Which columns to show per expiration — set any combination to True:
 SHOW_PREMIUM       = False    # "M/D"      raw bid premium
 SHOW_PER_WEEK      = False    # "M/D /wk"  bid normalized per week-to-expiration
-SHOW_PCT_PER_WEEK  = True    # "M/D %/wk" 100 * (bid/weeks) / current_price
+SHOW_PCT_PER_WEEK  = True     # "M/D %/wk" ROI/week:  100 * (bid/weeks) / current_price
+SHOW_PCT_PER_YEAR  = False    # "M/D %/yr" ROI/year:  pct_week * 52
 
 PREMIUM_DECIMALS  = 2   # decimals for raw premium columns
-PERWEEK_DECIMALS  = 4   # decimals for /wk and %/wk columns
+PERWEEK_DECIMALS  = 4   # decimals for /wk and %/wk / %/yr columns
+
+# When only SHOW_PCT_PER_WEEK and/or SHOW_PCT_PER_YEAR are on (i.e. no raw
+# $ premium columns), main() switches to "stacked" mode: every ticker in
+# TICKERS is combined into ONE table (a "Ticker" column labels each row),
+# columns are week-buckets (Wk1, Wk2, ...) rather than specific dates so
+# tickers with different expiration calendars still line up, and the
+# result is saved to disk for you to color-code in Excel.
+EXPORT_FORMAT   = "xlsx"                   # "xlsx" or "csv"
+EXPORT_FILENAME = "option_roi_stacked"     # extension added automatically
 
 # Cache directory — every successful live download is saved here per
 # ticker. When the market's closed (nights/weekends/holidays*), the
@@ -173,8 +183,9 @@ def build_dataframe(current_price: float, chains: dict) -> tuple:
     formatting, and col_weeks maps each data column name to its
     weeks-to-expiration bucket for the "weeks" header row.
     """
-    if not (SHOW_PREMIUM or SHOW_PER_WEEK or SHOW_PCT_PER_WEEK):
-        raise ValueError("At least one of SHOW_PREMIUM / SHOW_PER_WEEK / SHOW_PCT_PER_WEEK must be True")
+    if not (SHOW_PREMIUM or SHOW_PER_WEEK or SHOW_PCT_PER_WEEK or SHOW_PCT_PER_YEAR):
+        raise ValueError("At least one of SHOW_PREMIUM / SHOW_PER_WEEK / "
+                          "SHOW_PCT_PER_WEEK / SHOW_PCT_PER_YEAR must be True")
 
     master_df = pd.DataFrame()
     col_kind  = {}
@@ -185,6 +196,7 @@ def build_dataframe(current_price: float, chains: dict) -> tuple:
         col_label = f"{exp_date.month}/{exp_date.day:02d}"
         wk        = weeks_away(expiration)
         per_week  = calls["bid"] / wk
+        pct_week  = 100 * per_week / current_price
 
         temp = calls[["strike"]].copy()
 
@@ -201,9 +213,15 @@ def build_dataframe(current_price: float, chains: dict) -> tuple:
 
         if SHOW_PCT_PER_WEEK:
             pct_label = f"{col_label} %/wk"
-            temp[pct_label] = 100 * per_week / current_price
+            temp[pct_label] = pct_week
             col_kind[pct_label] = "pct_week"
             col_weeks[pct_label] = wk
+
+        if SHOW_PCT_PER_YEAR:
+            pctyr_label = f"{col_label} %/yr"
+            temp[pctyr_label] = pct_week * 52
+            col_kind[pctyr_label] = "pct_year"
+            col_weeks[pctyr_label] = wk
 
         if master_df.empty:
             master_df = temp
@@ -230,6 +248,89 @@ def build_dataframe(current_price: float, chains: dict) -> tuple:
     return master_df, col_kind, col_weeks
 
 
+def build_stacked_table(ticker_data: list) -> pd.DataFrame:
+    """
+    ticker_data: list of (ticker_symbol, current_price, chains) tuples.
+
+    Builds ONE combined table across every ticker — a "Ticker" column
+    labels each row so multiple tickers stack vertically instead of
+    spreading out into side-by-side wide tables. Columns are keyed by
+    week-bucket ("Wk1 %/wk", "Wk2 %/yr", ...) rather than specific
+    expiration dates, so tickers with different expiration calendars
+    still line up under the same columns.
+
+    Only includes SHOW_PCT_PER_WEEK / SHOW_PCT_PER_YEAR — raw $ premiums
+    aren't directly comparable across tickers at different share prices,
+    which is the whole point of the ROI framing.
+
+    Assumes at most one expiration per week-bucket per ticker. If a
+    ticker has two expirations landing in the same bucket (e.g. a weekly
+    and a monthly overlapping), the later one processed wins.
+    """
+    all_frames = []
+
+    for ticker_symbol, current_price, chains in ticker_data:
+        rows = {}
+        for expiration, calls in chains.items():
+            wk = weeks_away(expiration)
+            for _, r in calls.iterrows():
+                pct_week = 100 * (r["bid"] / wk) / current_price
+                entry = rows.setdefault(r["strike"], {})
+                if SHOW_PCT_PER_WEEK:
+                    entry[f"Wk{wk} %/wk"] = pct_week
+                if SHOW_PCT_PER_YEAR:
+                    entry[f"Wk{wk} %/yr"] = pct_week * 52
+
+        if not rows:
+            continue
+
+        df = pd.DataFrame.from_dict(rows, orient="index")
+        df.index.name = "strike"
+        df = df.reset_index()
+
+        lo_bound = current_price * (1 + MIN_STRIKE_PCT / 100)
+        hi_bound = current_price * (1 + MAX_STRIKE_PCT / 100)
+        df = df[(df["strike"] >= lo_bound) & (df["strike"] <= hi_bound)]
+        if df.empty:
+            continue
+        df = df.sort_values(by="strike", ascending=False).reset_index(drop=True)
+
+        closest_idx = (df["strike"] - current_price).abs().idxmin()
+        df.insert(0, "", "")
+        df.loc[closest_idx, ""] = "<== spot"
+        df.insert(0, "Ticker", ticker_symbol)
+
+        all_frames.append(df)
+
+    if not all_frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(all_frames, ignore_index=True, sort=False)
+
+    week_cols = sorted(
+        (c for c in combined.columns if c not in ("Ticker", "strike", "")),
+        key=lambda c: (int(c.split()[0][2:]), c)   # "Wk3 %/wk" -> sort by 3, then label
+    )
+    combined = combined[["Ticker", "strike", ""] + week_cols]
+    combined[week_cols] = combined[week_cols].round(PERWEEK_DECIMALS)
+    return combined
+
+
+def export_stacked_table(df: pd.DataFrame):
+    if df.empty:
+        print("No data to export.")
+        return
+    if EXPORT_FORMAT == "xlsx":
+        path = EXPORT_FILENAME if EXPORT_FILENAME.endswith(".xlsx") else EXPORT_FILENAME + ".xlsx"
+        df.to_excel(path, index=False)
+    elif EXPORT_FORMAT == "csv":
+        path = EXPORT_FILENAME if EXPORT_FILENAME.endswith(".csv") else EXPORT_FILENAME + ".csv"
+        df.to_csv(path, index=False)
+    else:
+        raise ValueError(f"EXPORT_FORMAT must be 'xlsx' or 'csv', got {EXPORT_FORMAT!r}")
+    print(f"Saved stacked ROI table -> {path}")
+
+
 # ─────────────────────────────────────────────
 # PRINT
 # ─────────────────────────────────────────────
@@ -240,7 +341,7 @@ def format_cell(value, kind: str) -> str:
         return str(value)
     if kind == "premium":
         return f"{value:.{PREMIUM_DECIMALS}f}"
-    # per_week / pct_week
+    # per_week / pct_week / pct_year
     return f"{value:.{PERWEEK_DECIMALS}f}"
 
 
@@ -288,6 +389,30 @@ def print_table(ticker_symbol: str, current_price: float, master_df: pd.DataFram
 # MAIN
 # ─────────────────────────────────────────────
 def main():
+    # If the only active metrics are the ROI-style % columns (no raw $
+    # premium), combine every ticker into one stacked table and export it
+    # instead of printing separate per-ticker date-column grids.
+    stacked_mode = (SHOW_PCT_PER_WEEK or SHOW_PCT_PER_YEAR) and not SHOW_PREMIUM and not SHOW_PER_WEEK
+
+    if stacked_mode:
+        ticker_data = []
+        for ticker_symbol in TICKERS:
+            current_price, chains, as_of, from_cache = download_option_chain(ticker_symbol)
+            if not chains:
+                print(f"  No option chain data for {ticker_symbol}, skipping.\n")
+                continue
+            ticker_data.append((ticker_symbol, current_price, chains))
+
+        combined = build_stacked_table(ticker_data)
+        if combined.empty:
+            print("No data available to build the stacked ROI table.")
+            return
+
+        print(combined.to_string(index=False))
+        print()
+        export_stacked_table(combined)
+        return
+
     for ticker_symbol in TICKERS:
         current_price, chains, as_of, from_cache = download_option_chain(ticker_symbol)
         if not chains:
@@ -310,9 +435,10 @@ if __name__ == "__main__":
 '''
 PWD
 1) Premium/StckPrice/Weeks = premium per dollar invested per week
-1) make P/SP/wk in dollar amounts. So $10/$50/2wk would mean: how much premium per 
-dollar invested did I get back every week? In short: return per week.
-make it in $ amount just for my understanding
+
+$P/$ Invested / Weeks = (100*Premium)/StckPrice/Weeks
+= 
+
 2) make it uniform across all my tickers
 -> final table, have the premium/week/stock price,
 stack the tickers like first display all Sofi, but have a column to show it's SOFI
