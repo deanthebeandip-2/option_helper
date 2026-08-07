@@ -1,0 +1,38 @@
+
+'''
+8/7 workflow
+1) have the stacked table show the date as well, easier to see which week i'm looking at. Also check the 
+weeks away math. If today is 8/7 and the market hasn't closed yet, I still consider it "1 week away", 8/14 is 2 weeks away.
+However, the moment 8/7 market close and the expiration date is closed (for example it's 4:30pm EST on a Friday, then 
+8/14 is updated to "1 week away", 8/21 is the "2 weeks away". Have to use this logic instead of counting days.
+
+2) Have +n rows above the strike price and +m rows below, # of rows to display above and below current price
+depend on hard coded n and m
+
+3) instead of NaN in the stacked table, please just show 0, easier to read
+
+4) For show percentage per week and year, please show the multiple, for example a
++100% would just be 2x, +150% would be 2.5x. Just easier to read at a glance. (want to know with
+every dollar invested, how much this dollar would be per week or per year)
+5) please store xlsx files in a folder called "reports", easier to check
+6) please attach a datetime to each xlsx with MMDDHHMMSS just so I know when I ran the view
+
+
+
+3) have a lookup table, where for each one I can add my "Cost Basis" price, just to show
+how much I also lose if I sell at a loss. This way it completely balances out, direct profit
+no matter what.
+So for example if I bought at 100, and i select a 101 strike price, then it's
+101's Premium + (101-100)*100 shares = pure profit
+
+If I bought at 100 and I select 98 strike price, it's
+98's Premium + (98-100)*100 shares = pure profit
+
+So:
+Total Premium + (strike price - cost basis)*100 shares = PL for this option.
+
+
+4) down the line, combine these 2 babies to make my MC+2MKV model help assess risk, 
+then I can combine the risk + pure profit to create a predictive hedging tool.
+Each strike price will have a "probability" attached, just to easily visualize how possible this price is 1 week away.
+'''
